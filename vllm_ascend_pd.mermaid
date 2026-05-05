@@ -15,129 +15,149 @@ sequenceDiagram
     participant D as Decode<br/>(vllm serve)<br/>kv_role=kv_consumer
 
     rect rgb(232,245,233)
-    Note over C,D: ══════════ 启动阶段：Prefill 端初始化 ══════════
-    Note over PFW: register_kv_caches()<br/>1. 获取 KV cache 的 data_ptr() 和 shape<br/>2. 计算 block_len = element_size × prod(block_shape)<br/>3. 计算 kv_caches_base_addr 列表<br/>4. 调用 global_te.register_buffer(ptrs, lengths)
-    PFW->>TE_P: register_memory(ptr, size)<br/>将每层 KV cache 显存地址注册到 TransferEngine
-    Note over PFW: 组装 MooncakeAgentMetadata:<br/>{engine_id, te_rpc_port,<br/>kv_caches_base_addr, num_blocks, local_ip}
-    PFW->>PFST: 启动 KVCacheSendingThread<br/>传入 metadata + side_channel_host/port
-    Note over PFST: run():<br/>计算 handshake_port =<br/>kv_port + dp_rank×tp×pp×pcp + device_index<br/>在 tcp://host:handshake_port 上<br/>bind ZMQ ROUTER socket<br/>进入 run_busy_loop() 等待请求
+    Note over C,D: 启动阶段：Prefill 端初始化
+    Note over PFW: register_kv_caches()<br/>1. 获取 KV cache data_ptr / shape<br/>2. 计算 block_len<br/>3. 生成 kv_caches_base_addr<br/>4. 注册到 TransferEngine
+    PFW->>TE_P: register_memory(ptr, size)
+    Note over PFW: 生成 MooncakeAgentMetadata<br/>{engine_id, te_rpc_port,<br/>kv_caches_base_addr, num_blocks, local_ip}
+    PFW->>PFST: 启动 KVCacheSendingThread
+    Note over PFST: 计算 handshake_port<br/>bind ZMQ ROUTER<br/>等待 GET_META / DONE_RECVING
     end
 
     rect rgb(227,242,253)
-    Note over C,D: ══════════ 启动阶段：Decode 端初始化 ══════════
-    Note over DW: register_kv_caches()<br/>1. 同样获取 KV cache 的 data_ptr() 和 shape<br/>2. 计算 block_len<br/>3. 调用 global_te.register_buffer(ptrs, lengths)
-    DW->>TE_D: register_memory(ptr, size)<br/>将每层 KV cache 显存地址注册到 TransferEngine
-    Note over DW: 启动 KVCacheRecvingThread<br/>传入 engine + side_channel_host/port + kv_caches_base_addr
-    Note over DWR: run():<br/>ready_event.set()<br/>进入循环等待 request_queue.get()
+    Note over C,D: 启动阶段：Decode 端初始化
+    Note over DW: register_kv_caches()<br/>1. 获取 KV cache data_ptr / shape<br/>2. 计算 block_len<br/>3. 注册到本端 TransferEngine
+    DW->>TE_D: register_memory(ptr, size)
+    DW->>DWR: 启动 KVCacheRecvingThread
+    Note over DWR: 等待 request_queue.get()
+    Note over DW: 约束：prefill_tp_size >= decode_tp_size<br/>否则直接报错
     end
 
     rect rgb(255,243,224)
-    Note over C,D: ══════════ 阶段1：Client 请求到达 Proxy ══════════
-    C->>P: HTTP POST /v1/completions<br/>stream=true, max_tokens=N,<br/>prompt="..."
+    Note over C,D: 阶段1：Client 请求到达 Proxy
+    C->>P: HTTP POST /v1/completions<br/>stream=true, max_tokens=N, prompt=...
     end
 
     rect rgb(252,228,236)
-    Note over C,D: ══════════ 阶段2：Proxy 选 Prefiller 并发送 Prefill 请求 ══════════
-    Note right of P: 1. 计算负载分数 prefiller_score<br/>2. 最小堆 select_prefiller()<br/>3. 生成 request_id = uuid4()<br/>4. acquire_aborted_prefiller_requests()
-    P->>PF: HTTP POST /v1/completions<br/>X-Request-Id: {uuid}<br/>stream=false, max_tokens=1, min_tokens=1<br/>kv_transfer_params: {<br/>  do_remote_decode: true,<br/>  do_remote_prefill: false,<br/>  remote_engine_id: null,<br/>  remote_block_ids: null,<br/>  remote_host: null,<br/>  remote_port: null,<br/>  aborted_request: [req_a, req_b]<br/>}
-
-    Note over PF: vllm 正常调度请求<br/>执行 prefill 计算<br/>生成 1 个 token 后结束<br/>status = FINISHED_LENGTH_CAPPED
-
-    Note over PFSched: request_finished() 检测到:<br/>do_remote_decode=true<br/>且 status=FINISHED_LENGTH_CAPPED<br/>→ 延迟释放 KV block<br/>→ 加入 _reqs_need_send<br/>→ 组装返回给 proxy 的 kv_transfer_params
-
-    PFSched->>PFSched: 计算延迟释放信息:<br/>delay_free_blocks = len(block_ids) > 0<br/>num_prompt_blocks = ceil(prompt_len / block_size)<br/>_reqs_need_send[req_id] = time.time()
-
-    PF-->>P: HTTP 200 JSON Response<br/>{<br/>  kv_transfer_params: {<br/>    do_remote_prefill: true,<br/>    do_remote_decode: false,<br/>    remote_block_ids: [0,1,2,3,4],<br/>    remote_engine_id: "engine_abc",<br/>    remote_request_id: "req_xxx",<br/>    remote_host: "10.101.26.98",<br/>    remote_port: 30000,<br/>    remote_pcp_size: 1,<br/>    remote_dcp_size: 1,<br/>    remote_ptp_size: 8,<br/>    last_token_id: 12345,<br/>    remote_multi_nodes_meta_mapping: {<br/>      "0": {host:"10.101.26.98", engine_id:"engine_abc"},<br/>      "1": {host:"10.101.26.98", engine_id:"engine_abc"}<br/>    },<br/>    num_prompt_blocks: 5<br/>  }<br/>}
-
-    Note over P: 释放 prefiller 的 active_tokens<br/>保留 active_kv_cache（等 decode 第一个 chunk）
+    Note over C,D: 阶段2：Proxy 选 Prefiller 并发送 Prefill 请求
+    Note right of P: 计算 prefiller_score<br/>select_prefiller()<br/>生成 request_id=uuid
+    P->>PF: HTTP POST /v1/completions<br/>X-Request-Id: {uuid}<br/>stream=false, max_tokens=1, min_tokens=1<br/>kv_transfer_params = {<br/>do_remote_decode:true,<br/>do_remote_prefill:false,<br/>aborted_request:[...]<br/>}
+    Note over PF: 执行 prefill<br/>生成 1 个 token 后结束
+    Note over PFSched: request_finished()<br/>检测到 do_remote_decode=true<br/>且 status=FINISHED_LENGTH_CAPPED<br/>延迟释放 block，构造返回给 proxy 的 kv_transfer_params
+    PF-->>P: HTTP JSON<br/>kv_transfer_params = {<br/>do_remote_prefill:true,<br/>do_remote_decode:false,<br/>remote_block_ids:[...],<br/>remote_engine_id,...<br/>remote_host,...<br/>remote_port,...<br/>remote_ptp_size,...<br/>num_prompt_blocks,...<br/>}
+    Note over P: release_prefiller(active_tokens)<br/>保留 active_kv_cache
     end
 
     rect rgb(225,245,254)
-    Note over C,D: ══════════ 阶段3：Proxy 选 Decoder 并转发 Decode 请求 ══════════
-    Note right of P: 最小堆 select_decoder()
-    P->>D: HTTP POST /v1/completions<br/>X-Request-Id: {同一个uuid}<br/>stream=true, max_tokens=N<br/>原始 prompt<br/>kv_transfer_params: {prefill返回的完整版}
+    Note over C,D: 阶段3：Proxy 选 Decoder 并转发 Decode 请求
+    Note right of P: select_decoder()
+    P->>D: HTTP POST /v1/completions<br/>X-Request-Id: {同一个uuid}<br/>原始 prompt + kv_transfer_params
     end
 
     rect rgb(243,229,245)
-    Note over C,D: ══════════ 阶段4：Decode 调度器识别远端 Prefill 请求 ══════════
-    Note over DSched: get_num_new_matched_tokens():<br/>检测到 do_remote_prefill=true<br/>count = len(prompt_token_ids) - num_computed_tokens<br/>返回 (count, True)<br/>→ 不本地 prefill，等远端 KV
-
-    Note over DSched: update_state_after_alloc():<br/>检测到 do_remote_prefill=true 且 remote_block_ids 存在<br/>local_block_ids = blocks.get_unhashed_block_ids()<br/>_reqs_need_recv[req_id] = (request, local_block_ids, num_external_tokens)<br/>do_remote_prefill 置为 False（只触发1次）
-
-    Note over DSched: build_connector_meta():<br/>遍历 _reqs_need_recv<br/>对每个 req 调用 meta.add_new_req():<br/>→ 构建 ReqMeta {<br/>  local_block_ids, num_external_tokens,<br/>  remote_block_ids, remote_host, remote_port,<br/>  remote_engine_id, remote_request_id,<br/>  remote_pcp/dcp/ptp_size,<br/>  remote_multi_nodes_meta_mapping,<br/>  num_prompt_blocks<br/>}<br/>清空 _reqs_need_recv
+    Note over C,D: 阶段4：Decode 调度器识别远端 Prefill 请求
+    Note over DSched: get_num_new_matched_tokens()<br/>若 do_remote_prefill=true<br/>返回 (len(prompt_token_ids)-num_computed_tokens, true)
+    Note over DSched: update_state_after_alloc()<br/>为请求分配本地 block<br/>local_block_ids = blocks.get_unhashed_block_ids()<br/>登记到 _reqs_need_recv
+    Note over DSched: build_connector_meta()<br/>构造 ReqMeta {<br/>local_block_ids,<br/>remote_block_ids,<br/>remote_host/port,<br/>remote_engine_id,<br/>remote_request_id,<br/>remote_pcp_size,<br/>remote_dcp_size,<br/>remote_ptp_size,<br/>num_prompt_blocks<br/>}
     end
 
     rect rgb(255,253,231)
-    Note over C,D: ══════════ 阶段5：Decode Worker 发起远端 KV 拉取 ══════════
-    Note over DW: start_load_kv(metadata):<br/>遍历 metadata.requests:<br/>1. 计算 tp_num_need_pulls<br/>2. 计算 chosen_rank_list（基于 request_id 哈希）<br/>3. 计算 remote_handshake_port_list<br/>4. 对每个 (offset, tp_num_need_pulls) 组合<br/>   调用 kv_recv_thread.add_request()
+    Note over C,D: 阶段5：Decode Worker 发起远端 KV 拉取（补充 TP 逻辑）
+    Note over DW: start_load_kv(metadata)<br/>prefill_tp_size = meta.remote_ptp_size or configured_prefill_tp_size
+    Note over DW: 计算 tp_num_need_pulls<br/>若 MLA/sparse: tp_num_need_pulls = 1<br/>否则:<br/>num_d_block_heads = max(1, num_kv_heads / decode_tp_size)<br/>num_p_block_heads = max(1, num_kv_heads / prefill_tp_size)<br/>tp_num_need_pulls = num_d_block_heads / num_p_block_heads
 
-    Note over DWR: 从 request_queue 取出任务<br/>调用 _handle_request()
+    alt TP 对等：prefill_tp_size == decode_tp_size
+        Note over DW: _get_remote_ranks_for_req():<br/>每个 decode tp rank 直接映射到对应 prefill tp rank<br/>若有 PP，则按 PP stage 展开<br/>sampled_nums = [[tp + pp*tp_size] ...]
+        Note over DW: 每个 decode rank 只需从 1 个对应的 prefill tp rank 拉取<br/>tp_num_need_pulls 通常为 1
+        DW->>DWR: add_request()<br/>remote_handshake_port = remote_port + chosen_rank
+        Note over DWR: 形成单路拉取任务<br/>local_block_ids ↔ remote_block_ids<br/>1:1 TP 映射
+    else TP 不对等：prefill_tp_size > decode_tp_size
+        Note over DW: 进入不对等 TP 路径<br/>prefill_tp 更大，说明同一份 decode KV 可能分散在多个 prefill TP rank 上
+        Note over DW: _get_remote_ranks_for_req():<br/>1. 基于 request_id 做 string_to_int64_hash()<br/>2. 用随机种子选 group<br/>3. 按 KV heads / TP group 选择远端 ranks
+        alt GQA/MHA 普通场景
+            Note over DW: 如果 prefill_tp_size > decode_tp_size<br/>每个 decode rank 需要从多个 prefill tp rank 拉取<br/>数量 = tp_num_need_pulls
+        else MLA / sparse / prefill_tp_size > num_kv_heads
+            Note over DW: 特殊路径：把 KV 视为单组或稀疏组<br/>tp_num_need_pulls 往往退化为 1<br/>但 rank 选择仍可能按 group 走
+        end
+        Note over DW: remote_handshake_port_list 可能是多路<br/>例如一个 decode rank 需要从多个 prefill ranks 拉不同 head 分片
+        loop 对每个 offset in [0, tp_num_need_pulls * prefill_pp_size)
+            DW->>DWR: add_request()<br/>携带 offset / tp_num_need_pulls / remote_handshake_port
+        end
+        Note over DWR: 同一请求会拆成多条 KV 拉取任务<br/>每条任务只负责一部分 head / 一部分 PP stage
+    end
+    end
 
     rect rgb(187,222,251)
-    Note over DWR,PFST: ──────── ZMQ Side-Channel 交互1: GET_META ────────
-    DWR->>PFST: ZMQ REQ→ROUTER<br/>tcp://{prefill_ip}:{handshake_port}<br/>msgpack encode: (b"get_meta_msg", "")
-    Note over PFST: run_busy_loop() 收到 frames<br/>解码 msg = (GET_META_MSG, "")<br/>返回预编码的 MooncakeAgentMetadata
-    PFST-->>DWR: ZMQ ROUTER→REQ<br/>msgpack: MooncakeAgentMetadata {<br/>  engine_id: "engine_abc",<br/>  te_rpc_port: 23456,<br/>  kv_caches_base_addr: [0x7f..., 0x7f..., ...],<br/>  num_blocks: 1024,<br/>  local_ip: "10.101.26.98"<br/>}
-    Note over DWR: 缓存远端 metadata:<br/>kv_caches_base_addr["engine_abc"][port] = [addr_list]<br/>remote_te_port["engine_abc"][port] = 23456
+    Note over C,D: ZMQ 交互1：GET_META
+    DWR->>PFST: ZMQ REQ→ROUTER<br/>(GET_META_MSG, "")
+    PFST-->>DWR: ZMQ ROUTER→REQ<br/>MooncakeAgentMetadata {<br/>engine_id,<br/>te_rpc_port,<br/>kv_caches_base_addr,<br/>num_blocks,<br/>local_ip<br/>}
+    Note over DWR: 缓存远端 metadata<br/>kv_caches_base_addr[engine_id][port]<br/>remote_te_port[engine_id][port]
     end
 
     rect rgb(200,230,201)
-    Note over DWR,TE_P: ──────── Mooncake TransferEngine: KV 数据传输 ────────
-    Note over DWR: _transfer_kv_cache():<br/>1. num_local_blocks = len(local_block_ids)<br/>2. 如果为0 → prefix cache 全命中，跳过传输<br/>3. group_concurrent_contiguous() 合并连续 block<br/>4. 计算 layer 范围 [first_layer_index, end_layer_index)<br/>5. MTP层: end_layer_index += 1<br/>6. 拼接 src_list/dst_list/length_list:<br/>   src = local_base + local_block_id×block_len + offset×inner_len<br/>   dst = remote_base + remote_block_id×inner_len<br/>   length = inner_len × num_contiguous_blocks
+    Note over C,D: KV 数据传输：TransferEngine
+    Note over DWR: _transfer_kv_cache()<br/>1. 计算 first_layer_index / end_layer_index<br/>2. 若 speculative_config != None 且位于最后一个 prefill PP stage<br/>   支持 MTP：end_layer_index += 1
+    Note over DWR: 按 layer/block/head 构造:<br/>src_list / dst_list / length_list
+    alt TP 对等
+        Note over DWR: 每个 decode rank 从对应 prefill rank 拉完整 KV block<br/>inner_offset 通常为 0<br/>不需要 head 级拼装
+    else TP 不对等
+        Note over DWR: inner_block_len = block_len / tp_num_need_pulls<br/>每条任务只拉一个 head 分片<br/>不同 offset 对应不同 head slice
+    end
+    DWR->>TE_D: batch_transfer_sync_read(session_id,<br/>src_list, dst_list, length_list)
+    TE_D->>TE_P: 远端显存直读
+    TE_P-->>TE_D: 返回数据
+    TE_D-->>DWR: ret = 0
 
-    DWR->>TE_D: batch_transfer_sync_read(<br/>  session_id="10.101.26.98:23456",<br/>  src_list=[本地KV显存地址],<br/>  dst_list=[远端KV显存地址],<br/>  length_list=[每段字节数]<br/>)
-    TE_D->>TE_P: ASCEND P2P RDMA-like 直读<br/>按 layer/block/head 从 prefill 显存<br/>直接搬到 decode 显存
-    TE_P-->>TE_D: 传输完成
-    TE_D-->>DWR: ret = 0 (成功)
-
-    Note over DWR: 传输后处理:<br/>1. tp_num_need_pulls>1 → reformat_kv_cache<br/>   (GQA 场景按 head 拼装)<br/>2. enable_kv_nz → NZ 格式转换<br/>3. 可选用 fused op 加速:<br/>   torch.ops._C_ascend.transpose_kv_cache_by_block
+    alt TP 不对等且 tp_num_need_pulls > 1
+        Note over DWR: 传输后必须 reformat_kv_cache()<br/>把多个 prefill tp rank 拉回来的 head 分片<br/>重新拼成 decode 端期望的 KV 布局
+        alt 启用 fused op
+            Note over DWR: reformat_kv_cache_with_fused_op()<br/>torch.ops._C_ascend.transpose_kv_cache_by_block(...)
+        else 未启用 fused op
+            Note over DWR: reformat_kv_cache()<br/>1. npu_paged_cache_load()<br/>2. _cat_kv_cache() 进行 head 维拼接<br/>3. 如需 NZ，再做 _nz_kv_cache()
+        end
+    else TP 对等
+        Note over DWR: 一般不需要 head 级 cat/reformat<br/>必要时仅做 NZ 格式整理
+    end
     end
 
     rect rgb(187,222,251)
-    Note over DWR,PFST: ──────── ZMQ Side-Channel 交互2: DONE_RECVING ────────
-    DWR->>PFST: ZMQ REQ→ROUTER<br/>msgpack: (<br/>  b"done_recving_msg",<br/>  request_id,<br/>  remote_port_send_num: {<br/>    30000: {num:1, host:"10.101.26.98"},<br/>    30001: {num:1, host:"10.101.26.98"}<br/>  }<br/>)
-    Note over PFST: 统计每个端口的 DONE_RECVING 数<br/>当 port_send_num[req] >= remote_port_send_num[port]["num"]<br/>→ task_tracker.update_done_task_count(req_id)<br/>→ 允许释放该 request 的 KV block
-    PFST-->>DWR: ZMQ ROUTER→REQ<br/>b"ACK"
+    Note over C,D: ZMQ 交互2：DONE_RECVING
+    DWR->>PFST: ZMQ REQ→ROUTER<br/>(DONE_RECVING_MSG, request_id, remote_port_send_num)
+    Note over PFST: 统计每个 request 的完成确认数<br/>TP 不对等时，通常要等多个 remote port 都确认完
+    alt TP 对等
+        Note over PFST: 1 路或少量端口 ACK 后即可释放
+    else TP 不对等
+        Note over PFST: 要累计多个 prefill tp rank / 端口的完成数<br/>满足 remote_port_send_num[port].num 后才能真正 update_done_task_count()
     end
-
-    Note over DWR: _send_done_signal_to_free_remote_port():<br/>对 remote_port_send_num 中 num==0 的端口<br/>也发送 DONE_RECVING<br/>（释放那些不需要传数据但占着资源的端口）
+    PFST-->>DWR: ACK
     end
 
     rect rgb(255,249,196)
-    Note over C,D: ══════════ 阶段6：Decode 继续生成并流式返回 ══════════
-    Note over D: 远端 KV 已注入本地 paged KV cache<br/>scheduler 正常调度 decode step<br/>逐 token 生成
-
-    D-->>P: SSE: data: {"choices":[{"text":"你","stop_reason":null}]}
-    Note over P: 收到第一个 chunk 时<br/>release_prefiller_kv(prefiller_idx, score)<br/>→ 释放 prefiller 的 active_kv_cache
+    Note over C,D: 阶段6：Decode 继续生成并流式返回
+    Note over D: 远端 KV 已写入本地 paged KV cache<br/>decode 继续逐 token 生成
+    D-->>P: SSE chunk 1
+    Note over P: 第一个 chunk 到达时<br/>release_prefiller_kv()
     P-->>C: SSE 透传
-
-    D-->>P: SSE: data: {"choices":[{"text":"好","stop_reason":null}]}
-    P-->>C: SSE 透传
-
-    D-->>P: SSE: data: {"choices":[{"text":"","stop_reason":"stop"}]}
+    D-->>P: SSE chunk 2..N
     P-->>C: SSE 透传
     end
 
     rect rgb(255,224,178)
-    Note over C,D: ══════════ 阶段7 (可选)：stop_reason=recomputed 重试 ══════════
-    alt 远端 KV 已失效 (block 被提前释放)
-        D-->>P: SSE: data: {"choices":[{"stop_reason":"recomputed"}]}
-        Note over P: 把已生成 token 拼回 prompt:<br/>messages[0]["content"] = origin_prompt + generated_token<br/>max_tokens = origin_max_tokens - completion_tokens + retry_count
-        P->>PF: 重新选 prefiller，发 prefill 请求<br/>(新的 kv_transfer_params 初始版)
-        PF-->>P: 返回新 kv_transfer_params
-        P->>D: 重新选 decoder，转发 decode 请求<br/>(新 prompt + 新 kv_transfer_params)
+    Note over C,D: 阶段7（可选）：recomputed 重试
+    alt stop_reason == recomputed
+        D-->>P: SSE: stop_reason = recomputed
+        Note over P: 已生成 token 拼回 prompt<br/>重新选 Prefill / Decode<br/>再走一轮 HTTP + ZMQ + TransferEngine
+        P->>PF: 重新发 prefill 请求
+        PF-->>P: 返回新的 kv_transfer_params
+        P->>D: 重新发 decode 请求
         D-->>P: SSE 流式返回
         P-->>C: SSE 透传
     end
     end
 
     rect rgb(207,216,220)
-    Note over C,D: ══════════ 阶段8：请求完成，资源释放 ══════════
-    Note over P: release_decoder(decoder_idx, score)<br/>release_prefiller_kv 已在阶段6释放
-
-    Note over DSched: get_finished():<br/>返回 done_recving 集合<br/>→ scheduler 释放该 request 的本地 block
-
-    Note over PFSched: get_finished():<br/>返回 done_sending 集合<br/>→ scheduler 释放延迟的 KV block
-
-    Note over PFST: 若超时未收到 DONE_RECVING:<br/>VLLM_NIXL_ABORT_REQUEST_TIMEOUT<br/>→ _retrieve_expired_requests()<br/>→ 强制释放 block
+    Note over C,D: 阶段8：完成与释放
+    Note over P: release_decoder()<br/>prefiller 的 active_kv_cache 已在首个 chunk 释放
+    Note over DSched: get_finished()<br/>释放 decode 端本地 block
+    Note over PFSched: get_finished()<br/>释放 prefill 端延迟的 block
+    Note over PFST: 若超时未收到 DONE_RECVING<br/>按 VLLM_NIXL_ABORT_REQUEST_TIMEOUT 强制释放
     end
