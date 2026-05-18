@@ -141,21 +141,8 @@ sequenceDiagram
     P-->>C: SSE 透传
     end
 
-    rect rgb(255,224,178)
-    Note over C,D: 阶段7（可选）：recomputed 重试
-    alt stop_reason == recomputed
-        D-->>P: SSE: stop_reason = recomputed
-        Note over P: 已生成 token 拼回 prompt<br/>重新选 Prefill / Decode<br/>再走一轮 HTTP + ZMQ + TransferEngine
-        P->>PF: 重新发 prefill 请求
-        PF-->>P: 返回新的 kv_transfer_params
-        P->>D: 重新发 decode 请求
-        D-->>P: SSE 流式返回
-        P-->>C: SSE 透传
-    end
-    end
-
     rect rgb(207,216,220)
-    Note over C,D: 阶段8：完成与释放
+    Note over C,D: 阶段7：完成与释放
     Note over P: release_decoder()<br/>prefiller 的 active_kv_cache 已在首个 chunk 释放
     Note over DSched: get_finished()<br/>释放 decode 端本地 block
     Note over PFSched: get_finished()<br/>释放 prefill 端延迟的 block
