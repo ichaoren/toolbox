@@ -727,16 +727,12 @@ need_nz_cache = get_ascend_config().enable_kv_nz and is_kv_transfer_end
 
 通常需要额外适配的场景：
 
-- KV Cache 不是当前 `register_kv_caches()` 可识别的标准、MLA 或 sparse 结构。
-- KV head 到 TP rank 的映射无法用当前 `_get_remote_ranks_for_req()` 表达。
-- NPU KV Cache 需要新的 NZ、ND 或 fused op 格式转换。
-- 多模态或自定义 attention 引入了现有传输链路未覆盖的新 cache。
+- 新模型的 KV Cache 结构和当前已支持的标准、MLA、sparse 形态差别较大，导致 `register_kv_caches()` 不能正确识别地址、shape 或 `block_len`。
+- 新模型的并行切分方式和当前逻辑不一致，导致 KV head 到 TP rank 的映射、或拉取后的重排方式，不能直接复用现有实现。
 
 ### 8.2 接入与运行注意事项
 
 - P 节点 `prefill_tp_size` 必须大于等于 D 节点 `decode_tp_size`，否则 worker 初始化会报错。
 - Decode PP size 当前必须为 1，且当前实现不支持同时开启 PP 和 PCP。
 - P/D 节点必须配置互相可达的 Mooncake side channel 与通信网卡，`engine_id` 也必须彼此不同。
-- `kv_port` 是基础端口，实际 handshake port 会按 DP/TP/PP/PCP rank 偏移。
-- Proxy 只做应用层负载均衡；实例移除时会先 taint，再等待在途请求清空。
 - NPU 侧需要保证 CANN、torch-npu、Mooncake Transfer Engine 与 vLLM Ascend 版本匹配，最终效果仍需在真机压测验证。
