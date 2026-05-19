@@ -1,4 +1,4 @@
-# NPU 硬件下基于 MooncakeConnector 的 PD 分离处理流程报告
+# NPU 硬件下基于 MooncakeConnector 的 PD 分离处理流程
 
 ## 1. 背景与范围
 
