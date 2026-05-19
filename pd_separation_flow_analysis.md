@@ -183,6 +183,11 @@ class MooncakeConnector(KVConnectorBase_V1):
                 vllm_config, str(self.engine_id))
 ```
 
+两者可以简单理解为：
+
+- `MooncakeConnectorScheduler`：负责“决定要不要传、传哪些 block、何时释放”，偏调度与元信息生成。
+- `MooncakeConnectorWorker`：负责“真正去传”，偏 KV cache 注册、ZMQ 握手、Mooncake 数据拉取和完成通知。
+
 worker 侧初始化会读取 P/D 并行配置，并创建 Mooncake TransferEngine：
 
 ```python
@@ -331,20 +336,7 @@ async for chunk in stream_service_response_with_retry(
 
 当 D 开始返回第一个 chunk 时，Proxy 认为 D 已经可继续 decode，于是释放 P 节点统计中的 `active_kv_cache`。
 
-### 4.5 recomputed 与异常释放
-
-如果 D 返回的 `stop_reason` 是 `recomputed`，Proxy 会把已生成内容拼回 prompt，并重新走 P/D 选择流程：
-
-```python
-if stop_reason == "recomputed":
-    retry = True
-    retry_count += 1
-    req_data["prompt"] = origin_prompt + generated_token
-    req_data["max_tokens"] = origin_max_tokens - completion_tokens + retry_count
-    tmp_request_length = len(json.dumps(req_data).encode("utf-8"))
-    instance_info = await _handle_select_instance(api, req_data, tmp_request_length)
-    break
-```
+### 4.5 异常释放
 
 如果流式 decode 失败，Proxy 会标记 P 侧请求为 aborted，并释放 P 侧 KV 统计：
 
@@ -353,6 +345,16 @@ proxy_state.abort_prefiller_request(instance_info.prefiller_idx,
                                     instance_info.request_id)
 proxy_state.release_prefiller_kv(instance_info.prefiller_idx,
                                  instance_info.prefiller_score)
+```
+
+这些 aborted request 不会由 Proxy 直接调用 P 的内部接口释放，而是在下一次向同一个 P 发送 prefill 请求时，经 `kv_transfer_params.aborted_request` 一并透传给 P 处理：
+
+```python
+aborted_requests = proxy_state.acquire_aborted_prefiller_requests(prefiller_id)
+req_data["kv_transfer_params"] = {
+    ...
+    "aborted_request": list(aborted_requests),
+}
 ```
 
 ## 5. vLLM 调度侧流程
@@ -407,6 +409,8 @@ return delay_free_blocks, dict(
 
 这份字典经由 vLLM OpenAI 响应返回给 Proxy，再由 Proxy 填入给 D 的请求体。
 
+可以把 delayed free 理解为：P 先把这批 KV 暂时“挂起不释放”。后续 D 拉取完成并发送 `DONE_RECVING_MSG` 后，P 才会把对应请求标记为可回收。
+
 ### 5.3 D 侧声明远端 KV 命中
 
 D 收到 Proxy 转发的请求后，`kv_transfer_params` 中的 `do_remote_prefill=True` 表示 prompt KV 已经在 P 侧生成，D 应该远端加载而不是重复 prefill：
@@ -444,6 +448,8 @@ if params is not None and params.get("do_remote_prefill"):
 这一步将 P 的 `remote_block_ids` 映射到 D 的 `local_block_ids`，后续 worker 会按这些 block id 执行 NPU KV 拷贝。
 
 ### 5.5 构造 worker metadata
+
+可以把这一步理解为：scheduler 侧已经决定了“哪些请求要拉远端 KV、哪些请求还不能释放”，现在把这些决定打包成一份批次元信息交给 worker。worker 后续不再重新做调度判断，而是按这份 metadata 直接执行拉取和完成通知。
 
 每轮 scheduler 输出前，scheduler 侧构造 `MooncakeConnectorMetadata`，把 D 侧待接收请求和 P 侧 delayed free 请求统一交给 worker：
 
@@ -540,6 +546,26 @@ elif msg[0] == DONE_RECVING_MSG:
 - `GET_META_MSG`：D worker 请求 P worker 的 `MooncakeAgentMetadata`，包括 P KV Cache 地址列表和 TransferEngine RPC 端口。
 - `DONE_RECVING_MSG`：D worker 已完成 KV 拉取，P worker 可以把 delayed free 的请求标记为完成。
 
+P worker 还会根据 scheduler 下发的 `requests_to_send` 把请求加入 delayed free 追踪，只有对应远端 rank 真正参与传输时才进入待释放集合：
+
+```python
+if self.kv_send_thread is not None and self.pcp_size * self.dcp_size == 1:
+    for req_id, delay_start_time in metadata.requests_to_send.items():
+        if self.tp_rank in self._prefill_get_remote_rank(req_id):
+            self.kv_send_thread.add_delayed_request(req_id, delay_start_time)
+        else:
+            self.kv_send_thread.add_not_transfer_request(req_id)
+```
+
+如果 D 侧异常退出、长期没有发回 `DONE_RECVING_MSG`，`KVCacheTaskTracker` 还会按超时兜底强制释放，避免 P 侧显存一直挂住：
+
+```python
+if current_time - delay_start_time > envs.VLLM_NIXL_ABORT_REQUEST_TIMEOUT:
+    self.delayed_free_requests.popitem(last=False)
+    self.reqs_to_process.discard(request_id)
+    expired_requests.add(request_id)
+```
+
 ### 6.3 D 侧接收线程
 
 D worker 的 `start_load_kv()` 遍历 scheduler 下发的 `metadata.requests`，把每个远端拉取任务加入接收线程队列：
@@ -578,13 +604,6 @@ self.kv_recv_thread.add_request(
     all_task_done=(i == tp_num_need_pulls * self._prefill_pp_size - 1),
 )
 ```
-
-PCP/DCP 场景下，会先调用 `_get_kv_split_metadata()`，根据 P/D 的 context parallel 和 KV head 分布计算：
-
-- `remote_handshake_port_list`：当前 D rank 需要访问的 P rank 端口。
-- `local_block_ids_list`：D 本地要写入的 block。
-- `remote_block_ids_list`：P 侧要读取的 block。
-- `remote_port_send_num`：每个 P port 需要收到多少个 DONE 信号。
 
 ### 6.4 真实 KV 传输
 
@@ -652,172 +671,24 @@ if ret < 0:
 
 ### 6.5 NPU KV Cache 重排
 
-KV 拉取结束后，D 侧可能需要把拉回来的 KV 重新排布成当前 D rank 需要的布局：
+这一步可以简单理解为：Mooncake 先把 KV 数据“搬回来”，`reformat_kv_cache()` 再把这些数据整理成当前 D rank 真正可直接使用的 NPU KV cache 布局。只有当 TP 不对等、需要做 head 拼接，或者本地使用 NZ 格式时，才需要这一步。
 
 ```python
 is_kv_transfer_end = global_offset == tp_num_need_pulls * self._prefill_pp_size - 1
 need_cat_cache = tp_num_need_pulls > 1 and is_kv_transfer_end
 need_nz_cache = get_ascend_config().enable_kv_nz and is_kv_transfer_end
-use_fused_op = ascend_envs.VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK
 ```
 
-场景说明：
+含义上可以理解为：
 
-- `need_cat_cache`：P/D TP 不同或 GQA/MHA KV head 分布不同，需要把来自多个 P rank 的 KV 按 head 拼接。
-- `need_nz_cache`：NPU KV Cache 使用 NZ 格式，需要执行格式转换。
-- `use_fused_op`：可用自定义 fused op 时优先用 `_C_ascend.transpose_kv_cache_by_block`。
+- `need_cat_cache`：说明一个 D rank 从多个 P rank 拉回了多份 KV 分片，最后要拼成 D 端期望的完整 head 布局。
+- `need_nz_cache`：说明数据虽然已经拉回本地，但还要整理成 NPU 侧实际使用的缓存格式。
 
-fused op 路径：
+因此，`6.4` 解决的是“把数据拉回来”，`6.5` 解决的是“把数据整理到能直接参与后续 decode 的形态”。
 
-```python
-torch.ops._C_ascend.transpose_kv_cache_by_block(
-    k_caches, v_caches, block_ids_tensor, block_size,
-    num_kv_head, head_dim, tp_num_need_pulls, layers
-)
-```
+## 7. 关键 API 接口
 
-通用重排路径：
-
-```python
-torch_npu.atb.npu_paged_cache_load(
-    k_cache_layer,
-    v_cache_layer,
-    block_table,
-    block_len_tensor,
-    seq_starts=seq_start_tensor,
-    key=k_buffer,
-    value=v_buffer,
-)
-```
-
-GQA/MHA head 拼接后写回：
-
-```python
-torch_npu._npu_reshape_and_cache(
-    key=k_buffer,
-    value=v_buffer,
-    key_cache=k_cache_layer,
-    value_cache=v_cache_layer,
-    slot_indices=slot_mapping,
-)
-```
-
-NZ 格式写回：
-
-```python
-torch_npu.npu_scatter_pa_kv_cache(
-    k_buffer,
-    v_buffer,
-    k_cache_layer,
-    v_cache_layer,
-    slot_mapping,
-)
-```
-
-## 7. 关键数据结构
-
-### 7.1 Proxy 侧数据结构
-
-| 数据结构           | 所在文件                                   | 作用                                                          |
-| -------------- | -------------------------------------- | ----------------------------------------------------------- |
-| `ServerState`  | `load_balance_proxy_server_example.py` | 描述一个 P/D server，包括 host、port、HTTP client、负载统计和 aborted 请求集合 |
-| `ProxyState`   | `load_balance_proxy_server_example.py` | 维护 P/D 列表、优先队列、请求计数、实例增删和负载释放                               |
-| `InstanceInfo` | `load_balance_proxy_server_example.py` | 保存一次请求选中的 P/D 实例、score、request id                           |
-| `InstanceType` | `load_balance_proxy_server_example.py` | 标识 `prefill` / `decode` 类型                                  |
-
-`ServerState` 的关键字段：
-
-```python
-self.url = f"http://{host}:{port}/v1"
-self.client = httpx.AsyncClient(timeout=None, base_url=self.url, ...)
-self.active_tokens = 0
-self.active_kv_cache = 0
-self.active_requests = 0
-self.aborted_requests = set()
-```
-
-### 7.2 MooncakeConnector 侧数据结构
-
-| 数据结构                        | 作用                                                                                       |
-| --------------------------- | ---------------------------------------------------------------------------------------- |
-| `MooncakeAgentMetadata`     | 单个 worker 暴露给远端的元信息，包括 `engine_id`、TransferEngine RPC 端口、KV Cache base address 和 block 数 |
-| `ReqMeta`                   | D worker 拉取 KV 的请求级元信息，包括本地/远端 block、远端 host/port/engine、P/D 并行信息                        |
-| `MooncakeConnectorMetadata` | scheduler 传给 worker 的批级 metadata，包含 `requests`、`requests_to_send`、`reqs_in_batch`        |
-| `KVCacheTaskTracker`        | 追踪 send/recv 完成状态和 delayed free，支持超时强制释放                                                 |
-| `RemotePortInfo`            | PCP/DCP 多端口场景下记录远端 port 的 host 和应接收 DONE 次数                                              |
-| `SizedDict`                 | 限制远端 metadata 缓存大小，避免长期运行中无限增长                                                           |
-
-`MooncakeAgentMetadata`：
-
-```python
-class MooncakeAgentMetadata(msgspec.Struct, omit_defaults=True, dict=True):
-    engine_id: str
-    te_rpc_port: int
-    kv_caches_base_addr: list[int]
-    num_blocks: int
-    local_ip: str = ""
-```
-
-`ReqMeta`：
-
-```python
-@dataclass
-class ReqMeta:
-    local_block_ids: list[int]
-    num_external_tokens: int
-    remote_block_ids: list[int]
-    remote_host: str
-    remote_port: int
-    remote_engine_id: str
-    remote_request_id: str
-    remote_pcp_size: int
-    remote_dcp_size: int
-    remote_ptp_size: int | None
-    remote_multi_nodes_meta_mapping: dict[str, dict[str, Any]]
-    num_prompt_blocks: int
-```
-
-### 7.3 `kv_transfer_params` 字段
-
-| 字段                                | 产生方         | 消费方                 | 说明                                 |
-| --------------------------------- | ----------- | ------------------- | ---------------------------------- |
-| `do_remote_decode`                | Proxy       | P scheduler         | 表示 P 完成 prefill 后要为远端 D 保留 KV      |
-| `do_remote_prefill`               | P scheduler | D scheduler         | 表示 D 不本地 prefill，改为拉取远端 KV         |
-| `remote_block_ids`                | P scheduler | D worker            | P 侧已计算 KV block id                 |
-| `remote_engine_id`                | P scheduler | D worker            | P engine 标识，用于 metadata 缓存和冲突检查    |
-| `remote_request_id`               | P scheduler | D worker / P worker | P 侧请求 id，用于 rank 选择和完成通知           |
-| `remote_host`                     | P scheduler | D worker            | P 侧 side channel host              |
-| `remote_port`                     | P scheduler | D worker            | P 侧 side channel base port         |
-| `remote_pcp_size`                 | P scheduler | D worker            | P 侧 prefill context parallel size  |
-| `remote_dcp_size`                 | P scheduler | D worker            | P 侧 decode context parallel size   |
-| `remote_ptp_size`                 | P scheduler | D worker            | P 侧 tensor parallel size           |
-| `remote_multi_nodes_meta_mapping` | P scheduler | D worker            | 多节点场景中 rank 到 host/engine 的映射      |
-| `num_prompt_blocks`               | P scheduler | D worker            | prompt 总 block 数，用于 CP 场景 block 拆分 |
-| `last_token_id`                   | P scheduler | D server            | P 最后一个 token，供上层协议使用               |
-| `aborted_request`                 | Proxy       | P server            | 通知 P 释放此前异常中止请求的 KV                |
-
-## 8. 关键 API 接口
-
-### 8.1 外部 HTTP API
-
-| API                    | 方法   | 作用                                  |
-| ---------------------- | ---- | ----------------------------------- |
-| `/v1/completions`      | POST | OpenAI completion 入口                |
-| `/v1/chat/completions` | POST | OpenAI chat completion 入口           |
-| `/healthcheck`         | GET  | 返回 proxy 状态和 P/D 实例数量               |
-| `/instances/add`       | POST | 动态增加 P 或 D 实例                       |
-| `/instances/remove`    | POST | 动态移除 P 或 D 实例；有请求时先 taint，等待请求清空后移除 |
-
-动态增删实例的数据格式：
-
-```json
-{
-  "type": "prefill",
-  "instances": ["127.0.0.1:8102", "127.0.0.1:8103"]
-}
-```
-
-### 8.2 KV Connector scheduler 接口
+### 7.1 KV Connector scheduler 接口
 
 | 接口                              | 作用                                                 |
 | ------------------------------- | -------------------------------------------------- |
@@ -827,7 +698,7 @@ class ReqMeta:
 | `request_finished()`            | 请求结束时判断是否延迟释放 P 侧 KV，并生成给 D 的 `kv_transfer_params` |
 | `set_xfer_handshake_metadata()` | 设置跨 rank handshake metadata，支持多节点 host/engine 映射   |
 
-### 8.3 KV Connector worker 接口
+### 7.2 KV Connector worker 接口
 
 | 接口                         | 作用                                            |
 | -------------------------- | --------------------------------------------- |
@@ -839,7 +710,7 @@ class ReqMeta:
 | `save_kv_layer()`          | MooncakeConnector 不显式逐层 save，当前为空实现           |
 | `wait_for_save()`          | MooncakeConnector 不显式 save，当前为空实现             |
 
-### 8.4 Mooncake/ZMQ 接口
+### 7.3 Mooncake/ZMQ 接口
 
 | 接口或消息                                       | 方向                   | 作用                                             |
 | ------------------------------------------- | -------------------- | ---------------------------------------------- |
@@ -848,185 +719,24 @@ class ReqMeta:
 | `DONE_RECVING_MSG`                          | D worker -> P worker | 通知 P 侧 KV 已拉取完成，可释放 delayed free               |
 | `ACK`                                       | P worker -> D worker | P 收到 DONE 后确认                                  |
 
-## 9. 特殊设计
+## 8. 新模型接入与注意事项
 
-### 9.1 Pull 模式 KV 传输
+### 8.1 新模型接入是否需要额外适配
 
-本文限定的 `MooncakeConnector` 使用 pull 模式：P 节点完成 prefill 后只返回远端 KV metadata，并延迟释放本地 KV Cache；D 节点拿到 metadata 后主动从 P 节点拉取 KV Cache。这个设计让 Proxy 不参与 KV 数据面，只负责请求编排和 `kv_transfer_params` 透传。
+如果新模型已经能在 vLLM Ascend NPU 后端正常运行，且 KV Cache 结构仍属于当前 `MooncakeConnector` 可识别的标准、MLA 或 sparse 形态，PD 分离通常不需要额外改 Proxy 或 Connector，重点是保持 P/D 两侧配置一致。
 
-关键行为：
+通常需要额外适配的场景：
 
-- P 侧 `request_finished()` 返回 `do_remote_prefill=True`、`remote_block_ids`、`remote_host`、`remote_port`、`remote_engine_id` 等字段。
-- D 侧 scheduler 识别 `do_remote_prefill=True` 后预分配本地 KV blocks，并通过 worker 拉取远端 KV。
-- D worker 先用 ZMQ `GET_META_MSG` 获取 P 侧 KV Cache 地址和 Mooncake RPC 端口，再调用 `TransferEngine.batch_transfer_sync_read()` 完成 NPU 间 KV 读取。
-- D 拉取完成后发送 `DONE_RECVING_MSG`，P 侧收到 ACK 后释放 delayed free 请求。
-
-### 9.2 P/D 独立并行策略
-
-PD 分离允许 P 节点和 D 节点使用不同实例数和并行策略，从而分别优化 TTFT 与 TPOT：
-
-- P 节点更关注长 prompt prefill 吞吐，可按输入长度和 prefill 峰值压力独立扩容。
-- D 节点更关注逐 token 生成延迟和稳定吞吐，可按 decode 并发独立扩容。
-- `kv_connector_extra_config.prefill` 和 `kv_connector_extra_config.decode` 需要同时描述两侧 DP/TP/PP 配置，D 侧会据此计算远端 rank、port 和 block 映射。
-
-### 9.3 TP 对等与不对等
-
-D worker 会根据请求 id 稳定选择 P rank，使同一个请求在各 D rank 上得到一致的远端 rank 选择：
-
-```python
-seed = string_to_int64_hash(req_id)
-rand = random.Random(seed)
-```
-
-`tp_num_need_pulls` 描述一个 D rank 需要从多少个 P TP rank 拉取 KV 分片：
-
-```python
-if self.vllm_config.model_config.is_deepseek_mla:
-    self.tp_num_need_pulls = 1
-else:
-    num_d_block_heads = max(1, self.num_key_value_heads // self.tp_size)
-    num_p_block_heads = max(1, self.num_key_value_heads // self._prefill_tp_size)
-    self.tp_num_need_pulls = num_d_block_heads // num_p_block_heads
-```
-
-TP 对等场景：
-
-- 条件：P 侧 `prefill_tp_size` 等于 D 侧 `decode_tp_size`。
-- 映射：每个 D TP rank 只连接对应的 P TP rank，`tp_num_need_pulls=1`。
-- 传输：D rank 只从一个 P rank 拉取属于自己的 KV head/block 分片，不需要跨 P rank 拼接 KV head。
-
-TP 不对等场景：
-
-- 约束：仅支持 P 侧 TP 大于 D 侧 TP，且 P TP 是 D TP 的整数倍；如果 P TP 小于 D TP，worker 初始化会报错。
-- 映射：`_get_remote_ranks_for_req()` 按请求 id 和 KV head group 选择远端 P rank 组，`tp_num_need_pulls` 决定每个 D rank 发起多少次 pull。
-- 传输：`start_load_kv()` 会对同一请求向多个 `remote_handshake_port` 下发 `add_request()`，并用 `offset` 标识当前 pull 的位置。
-- 重排：最后一个 pull 完成后，如果 `tp_num_need_pulls > 1`，D 侧触发 `need_cat_cache`，把多个 P rank 拉回来的 KV 按 head 拼接到 D 本地 KV Cache 布局。
-
-### 9.4 MLA、GQA 与硬件约束
-
-MooncakeConnector 的设计覆盖 MLA/GQA 等模型 KV Cache 形态，但不同形态会影响 block 长度推导、rank 映射和重排路径：
-
-- MLA 场景通过 `model_config.is_deepseek_mla` 走特殊处理，通常 `tp_num_need_pulls=1`。
-- GQA/MHA 的非对等 TP 场景需要按 KV head 分片拉取，并在 D 侧完成 head 拼接或格式重排。
-- NZ 格式开启时，D 侧需要在 KV 拉取后执行 NPU 格式写回。
-- 参考特性说明中 A2、A3 均为可用配置，但不支持异构 P/D 节点，例如 P 使用 A2、D 使用 A3。
-
-## 10. 异常与资源释放
-
-### 10.1 delayed free
-
-P 侧在 `request_finished()` 中返回 `delay_free_blocks=True` 后，vLLM 不会立即释放该请求的 KV blocks。P worker 会把请求加入 delayed free 追踪：
-
-```python
-if self.kv_send_thread is not None and self.pcp_size * self.dcp_size == 1:
-    for req_id, delay_start_time in metadata.requests_to_send.items():
-        if self.tp_rank in self._prefill_get_remote_rank(req_id):
-            self.kv_send_thread.add_delayed_request(req_id, delay_start_time)
-        else:
-            self.kv_send_thread.add_not_transfer_request(req_id)
-```
-
-D 拉取完成后发送 `DONE_RECVING_MSG`，P 侧 `KVCacheTaskTracker` 将请求放入 `finished_requests`，随后 vLLM 可以释放 blocks。
-
-### 10.2 超时强制释放
-
-如果 D 侧异常，P 侧 delayed free 不能永久保留。`KVCacheTaskTracker` 会按 `VLLM_NIXL_ABORT_REQUEST_TIMEOUT` 超时强制释放：
-
-```python
-if current_time - delay_start_time > envs.VLLM_NIXL_ABORT_REQUEST_TIMEOUT:
-    self.delayed_free_requests.popitem(last=False)
-    self.reqs_to_process.discard(request_id)
-    expired_requests.add(request_id)
-```
-
-变量名来自 vLLM envs，但在 MooncakeConnector 中也用于 delayed free 超时控制。
-
-### 10.3 Proxy abort 释放
-
-Proxy 在 decode 流式异常时不会直接调用 P 的内部接口，而是在下一次向同一个 P 发送请求时携带 `aborted_request`：
-
-```python
-aborted_requests = proxy_state.acquire_aborted_prefiller_requests(prefiller_id)
-req_data["kv_transfer_params"] = {
-    ...
-    "aborted_request": list(aborted_requests),
-}
-```
-
-这使 P 能在正常请求路径中处理异常释放，避免 Proxy 直接依赖 vLLM 内部对象。
-
-## 11. 新模型接入是否需要额外适配
-
-### 11.1 通常不需要额外适配的情况
-
-如果新模型已经能在 vLLM Ascend NPU 后端正常运行，并且 KV Cache 结构符合当前 MooncakeConnector 支持的几类布局，PD 分离通常不需要额外改代理或 Connector：
-
-- 标准 KV Cache：形如 `[num_blocks, block_size, num_kv_heads, head_dim]` 或兼容布局。
-- DeepSeek MLA：`model_config.is_deepseek_mla=True`，当前实现会把 `tp_num_need_pulls` 设为 1，并使用 MLA block length 推导。
-- Sparse KV Cache：`register_kv_caches()` 通过 `len(first_kv_cache_tuple) == 3` 识别 sparse。
-- P/D 使用一致的模型、tokenizer、max model len、block size 和兼容采样配置。
-- P/D 的 `kv_connector_extra_config` 正确描述两侧 DP/TP/PP 配置。
-
-这类模型的接入重点是部署参数正确，而不是改代码。
-
-### 11.2 必须重点检查的模型属性
-
-新模型接入 PD 分离前应检查：
-
-| 检查项                                 | 原因                                               |
-| ----------------------------------- | ------------------------------------------------ |
-| `num_key_value_heads`               | 决定 TP 下每个 rank 的 KV head 分布和 `tp_num_need_pulls` |
-| `head_dim`                          | 决定标准 KV block 字节数                                |
-| `kv_lora_rank` / `qk_rope_head_dim` | MLA 场景下决定 K/V buffer 维度                          |
-| KV Cache tuple 长度                   | 当前用 tuple 长度判断 MLA/Sparse/标准 KV                  |
-| KV Cache shape                      | `register_kv_caches()` 通过 shape 推导 `block_len`   |
-| `block_size`                        | P/D 必须一致，否则 block id 对应 token 范围不一致              |
-| PP layer partition                  | P 开启自定义 PP 切分时，D 必须能用相同 partition 推导远端层范围        |
-| NPU NZ 配置                           | `enable_kv_nz` 会改变 D 侧拉取后的写回格式                   |
-| 自定义 attention cache                 | 非标准 KV Cache 地址布局可能需要修改地址计算和重排逻辑                 |
-
-### 11.3 需要额外适配的情况
-
-以下情况通常需要额外适配：
-
-- 新模型的 KV Cache 不是当前 `register_kv_caches()` 可识别的标准、MLA 或 Sparse tuple。
-- K/V cache 分层数量、tuple 顺序或 tensor shape 与现有 `block_len` 推导不兼容。
-- 模型使用特殊 attention 结构，KV head 与 TP rank 的映射不能用当前 `_get_remote_ranks_for_req()` 逻辑表示。
-- P 侧 PP layer partition 不是默认 vLLM split，且未通过 `pp_layer_partition` 显式传给 D。
+- KV Cache 不是当前 `register_kv_caches()` 可识别的标准、MLA 或 sparse 结构。
+- KV head 到 TP rank 的映射无法用当前 `_get_remote_ranks_for_req()` 表达。
 - NPU KV Cache 需要新的 NZ、ND 或 fused op 格式转换。
-- 多模态模型引入额外 cache，但该 cache 不属于现有 KV Cache 传输列表。
+- 多模态或自定义 attention 引入了现有传输链路未覆盖的新 cache。
 
-适配优先级建议：
-
-1. 优先确认 vLLM Ascend 本地单节点 NPU 推理可用。
-2. 再确认 P/D 使用相同模型权重、tokenizer、block size 和兼容的并行配置。
-3. 若仅是 PP layer partition 不一致，优先通过 `kv_connector_extra_config.prefill.pp_layer_partition` 配置解决。
-4. 若是 KV Cache shape 或格式不同，再适配 `register_kv_caches()`、`_transfer_kv_cache()` 和重排函数。
-5. 若需要模型特定逻辑，遵循 vLLM Ascend 插件规范，优先使用 patch、model runner 扩展或 NPU custom op，不建议直接新增或修改上游模型文件。
-
-## 12. 限制与注意事项
+### 8.2 接入与运行注意事项
 
 - P 节点 `prefill_tp_size` 必须大于等于 D 节点 `decode_tp_size`，否则 worker 初始化会报错。
-- Decode PP size 当前必须为 1。
-- 当前 worker 断言 PP 和 PCP 不能同时开启。
-- Proxy 只做应用层负载均衡，不保证强一致的分布式调度；实例移除时有请求会先 taint，等待请求清空后删除。
-- P/D 节点必须配置互相可达的 HCCL/GLOO/TP/HCCL 网卡和 Mooncake side channel 地址。
+- Decode PP size 当前必须为 1，且当前实现不支持同时开启 PP 和 PCP。
+- P/D 节点必须配置互相可达的 Mooncake side channel 与通信网卡，`engine_id` 也必须彼此不同。
 - `kv_port` 是基础端口，实际 handshake port 会按 DP/TP/PP/PCP rank 偏移。
-- `engine_id` 在 P/D 之间必须不同，D 获取 metadata 时会检查远端 engine id 不能等于本地 engine id。
-- NPU 场景需要 CANN、torch-npu、Mooncake Transfer Engine 与 vLLM Ascend 版本匹配。
-- 本报告只解释流程，不替代 NPU 真机压测；吞吐、延迟、显存和异常恢复仍需在真实硬件上验证。
-
-## 13. 关键流程总结
-
-完整在线流程可以归纳为八步：
-
-1. 用户请求进入 Proxy 的 `/v1/completions` 或 `/v1/chat/completions`。
-2. Proxy 根据 prefill score 和 P 侧 KV 占用选择 prefiller。
-3. Proxy 向 P 发送 `do_remote_decode=True`、`max_tokens=1` 的请求。
-4. P 完成 prefill，在 `request_finished()` 中延迟释放 KV，并返回 `do_remote_prefill=True` 的 `kv_transfer_params`。
-5. Proxy 将原始请求和 P 返回的 `kv_transfer_params` 转发给选中的 D。
-6. D scheduler 识别远端 prefill，分配本地 KV blocks，并通过 metadata 通知 D worker 拉取 KV。
-7. D worker 通过 ZMQ 获取 P worker 的 KV 地址和 Mooncake RPC 端口，用 `batch_transfer_sync_read()` 把 P NPU KV Cache 拉到 D NPU KV Cache。
-8. D 完成 KV 拉取和必要的 NPU KV Cache 重排后继续 decode，并通过 DONE/ACK 机制通知 P 释放 delayed free。
-
-从新模型接入角度看，PD 分离本身主要依赖 KV Cache 的地址、block 字节数和并行映射。只要新模型的 KV Cache 结构能被 vLLM Ascend 和当前 MooncakeConnector 正确识别，通常不需要对 PD 分离链路做额外适配；反之，应优先围绕 KV Cache shape、TP/PP 映射和 NPU 格式重排进行最小化适配。
+- Proxy 只做应用层负载均衡；实例移除时会先 taint，再等待在途请求清空。
+- NPU 侧需要保证 CANN、torch-npu、Mooncake Transfer Engine 与 vLLM Ascend 版本匹配，最终效果仍需在真机压测验证。
