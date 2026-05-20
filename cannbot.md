@@ -2,46 +2,13 @@
 
 ## 1. 摘要
 
-本文以 `torch.ops.npu.split_interleaved_rope` 融合算子为例，系统总结一次借助 CANNBot Skills 完成 AscendC 融合算子开发的实践过程。
-
-本次优化的核心目标是将 MLA Decode 链路中 `index_q` 的 RoPE 处理从多算子组合：
-
-```text
-Slice + Cast + Cast + RotaryEmbedding + Slice + ConcatD
-```
-
-融合为单个自定义算子：
-
-```text
-torch.ops.npu.split_interleaved_rope
-```
-
-最终在保证功能正确、GE/非 GE 链路可用的前提下，将该链路耗时从 `32.241us` 优化到 `22.2us`。
+本文以 `torch.ops.npu.split_interleaved_rope` 融合算子为例，总结一次借助 CANNBot Skills 完成 AscendC 融合算子开发的实践过程。目标是将 MLA Decode 链路中的 `Slice + Cast + Cast + RotaryEmbedding + Slice + ConcatD` 融合为单算子实现，并在保证功能正确、GE/非 GE 链路可用的前提下，将耗时从 `32.241us` 优化到 `22.2us`。
 
 ## 2. 背景介绍
 
 本次业务场景存在一个关键前提：系统要求运行在 GE 模式下，而 GE 当前并不支持 Triton。因此，这条融合链路无法通过 Triton kernel 实现，只能采用 AscendC 自定义算子的方式满足 GE 编译与执行要求。
 
-这意味着本次工作不仅是链路融合优化，还需要同时满足以下条件：
-
-- 融合逻辑必须由 AscendC 实现。
-- 算子需要同时具备 eager 和 GE 两套可用路径。
-- GE 模式下要补齐 custom OPP、GE converter 和编译期 shape 传递能力。
-
-在上述约束下，MLA Decode 场景中的 `index_q` RoPE 处理成为典型的融合候选点。`index_q` 需要完成 interleaved RoPE 计算，并将 RoPE 部分与 NoPE 部分重新拼接。原始实现由多个图算子串联组成，典型链路为：
-
-```text
-Slice + Cast + Cast + RotaryEmbedding + Slice + ConcatD
-```
-
-该实现逻辑清晰，但在推理性能敏感场景下存在以下问题：
-
-- 算子数量较多，存在多次调度开销。
-- 中间 Tensor 读写和数据搬运较多。
-- RoPE 部分和 NoPE 部分拆分、转换、拼接过程较长。
-- GE 模式下，融合前后 shape 信息传递会影响下游算子编译期推导。
-
-因此，本次实践的目标是开发 AscendC 融合算子 `torch.ops.npu.split_interleaved_rope`，以单算子替代原有多算子链路，并在业务侧优先走融合实现、缺失时回退原始方案。围绕这一目标，本文进一步讨论如何借助 CANNBot Skills，将算子设计、GE 适配、精度调试与性能优化串联为一条完整的开发流程。
+在这一前提下，本次实践的核心目标是以 `torch.ops.npu.split_interleaved_rope` 替代原有多算子链路，并同时完成 GE 适配、精度对齐和性能优化。
 
 ## 3. CANNBot Skills 介绍和使用
 
@@ -49,7 +16,47 @@ CANNBot Skills 是面向 CANN 开发的可复用技能库，覆盖 AscendC 算�
 
 ### 3.1 适用场景、问题类型与能力分层
 
-从 `cannbot-skills` 仓库的整体设计来看，CANNBot 面向的不只是单一算子开发任务，而是一组围绕昇腾 NPU 开发的典型问题场景。其目标用户包括 CANN 社区开发者、Ascend C / PyPTO / TileLang 算子开发者，以及使用昇腾 NPU 进行模型推理优化的开发者。
+从 `cannbot-skills` 仓库的整体设计来看，CANNBot 面向的是一组围绕昇腾 NPU 开发的典型问题场景，覆盖算子开发、问题定位和模型推理优化。
+
+从整体组织方式看，CANNBot 可概括为“Teams 编排流程、Agents 承担角色、Skills 提供专项能力”的三层结构：
+
+```mermaid
+flowchart TB
+    T[Teams<br/>流程编排层]
+    A[Agents<br/>角色执行层]
+    S[Skills<br/>知识能力层]
+
+    T --> A
+    A --> S
+
+    T1[ops-registry-invoke<br/>注册算子开发流程]
+    T2[ops-direct-invoke<br/>Kernel直调开发流程]
+    T3[infer-model-optimize-team<br/>模型推理优化流程]
+
+    A1[architect<br/>需求分析/方案设计]
+    A2[developer<br/>代码开发/问题修复]
+    A3[tester<br/>测试设计/测试执行]
+    A4[reviewer<br/>代码检视/规范检查]
+
+    S1[tiling-design<br/>Tiling设计]
+    S2[precision-debug<br/>精度调试]
+    S3[runtime-debug<br/>运行时定位]
+    S4[ops-profiling<br/>性能采集分析]
+    S5[api-best-practices<br/>API最佳实践]
+
+    T --> T1
+    T --> T2
+    T --> T3
+    A --> A1
+    A --> A2
+    A --> A3
+    A --> A4
+    S --> S1
+    S --> S2
+    S --> S3
+    S --> S4
+    S --> S5
+```
 
 结合仓库中的 Skills、Teams 和 quickstart 入口，CANNBot 主要适用于以下几类场景：
 
@@ -64,19 +71,13 @@ CANNBot Skills 是面向 CANN 开发的可复用技能库，覆盖 AscendC 算�
 | 测试与验收 | 设计 ST/UT、补齐覆盖率、构建验收矩阵 | `ascendc-st-design`、`ascendc-ut-develop` |
 | 模型推理优化 | 图模式适配、融合算子替换、KVCache、多流优化 | `model/*` 目录下的推理优化 Skills 与 Teams |
 
-如果从“解决什么问题”的角度理解，CANNBot 的价值主要体现在三点：
+从“解决什么问题”的角度看，CANNBot 的价值主要体现在三点：
 
-- 当需求不清晰时，帮助开发者把算子语义、约束、验收标准和工程边界补齐。
-- 当问题难以定位时，提供面向精度、运行时、环境和性能的分场景排查路径。
-- 当流程较长时，通过 Teams、Agents 和 Skills 的分层组织，把需求分析、开发、测试和优化串成可复用流程。
+- 需求不清晰时，补齐算子语义、约束和验收标准。
+- 问题难定位时，提供面向精度、运行时和性能的分场景排查路径。
+- 流程较长时，以 Teams、Agents 和 Skills 串联需求、开发、测试和优化。
 
-从能力组织形式看，CANNBot Skills 采用三层结构：
-
-- `Teams`：面向完整任务流程的编排层。
-- `Agents`：面向具体角色的执行层，如架构、开发、测试、检视。
-- `Skills`：面向具体能力的知识和工具层，如 Tiling 设计、精度调试、性能分析。
-
-本次实践主要用到或参考了以下 Skills 能力：
+本次实践主要参考以下 Skills：
 
 | Skill | 在本次实践中的作用 |
 | --- | --- |
@@ -109,11 +110,7 @@ cd cannbot-skills
 bash cannbot-skills/plugins-official/ops-registry-invoke/init.sh project trae
 ```
 
-安装完成后，Trae 工作区下会生成 `.trae` 相关配置。正常情况下，在对话中发起 AscendC 注册算子开发请求时，主 Agent 会优先加载 CANNBot 的 `AGENTS.md` 及相关 Skills。若未生效，通常说明：
-
-- 工作流未正确安装
-- 当前项目没有加载 `.trae` 配置
-- 工作区不是预期的项目根目录
+安装完成后，Trae 工作区下会生成 `.trae` 配置；若会话中未能自动加载相关 `AGENTS.md` 和 Skills，通常需要检查工作流安装和项目根目录配置是否正确。
 
 为避免暴露具体工程细节，下面统一用代号表示：
 
@@ -129,7 +126,7 @@ bash cannbot-skills/plugins-official/ops-registry-invoke/init.sh project trae
 - `<jobs>`：并行构建任务数
 - `<soc_version>`：目标芯片或 SoC 版本
 
-对于类似“算子仓 A”这种 PyTorch + `torch_npu` 扩展工程，除了安装 CANNBot Skills，还需要明确工程自身的构建和安装方式。参考本次实践，常见流程是：
+对于类似“算子仓 A”这种 PyTorch + `torch_npu` 扩展工程，除安装 CANNBot Skills 外，还需要准备工程自身的构建与运行环境：
 
 ```bash
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
@@ -137,55 +134,42 @@ cd <repo_a_path>
 ./build.sh --install --jobs <jobs> <soc_version>
 ```
 
-custom OPP 场景下，还需要补充：
+若涉及 custom OPP，还需补充：
 
 ```bash
 export ASCEND_CUSTOM_OPP_PATH=<repo_a_path>/custom_opp/vendors/<vendor_name>
 export LD_LIBRARY_PATH=<repo_a_path>/custom_opp/vendors/<vendor_name>/op_proto/lib/<arch>:<repo_a_path>/custom_opp/vendors/<vendor_name>/op_impl/ai_core/tbe/op_tiling/lib/<arch>:/usr/local/lib/python3.9/site-packages/torch_npu/lib:${LD_LIBRARY_PATH:-}
 ```
 
-这部分配置对 GE custom op 至关重要。算子能否在图模式下被识别、编译并执行，除了 Python wheel 之外，还依赖 custom OPP 元数据与 tiling 库。
+这些配置决定了 GE custom op 能否被正确识别、编译和执行。
 
 ### 3.3 提示词模板与示例
 
 除按阶段描述任务外，更推荐直接提供“约束明确、可复现、带路径和验收条件”的提示词。结合本次 `split_interleaved_rope` 的开发过程，可将提示词概括为三类。这里重点给出通用模板，后文第 4 章再说明这些模板在实践中如何分阶段落地。
 
-第一类是“提需求”提示词，重点是把目标函数、目标仓库、参考实现、开发环境和交付要求一次说清。例如：
+第一类是“提需求”提示词，重点是一次性说明目标函数、参考实现、开发环境和交付要求。例如：
 
 ```text
 /plan 模式
-现在有一个 pytorch 实现的函数，函数位于业务仓 B 的测试脚本 B 中，
-目标参考函数为 _ref_rotary_embedding_remove_padding_interleaved，
-现在需要实现一个 Ascend C 的融合算子，融合这个函数中的小算子，
-包括 torch.split、cast、cat 等。
-
-你现在在算子仓 A 中开发 AscendC 算子，
-参考仓内已有对标算子的实现和调用方式，
-使用 README 中提到的编译和单测方法，
-生成新算子代码和 UT 测试脚本，
-新算子名称为 torch.ops.npu.split_interleaved_rope。
+基于业务仓 B 的测试脚本 B 中的参考函数 _ref_rotary_embedding_remove_padding_interleaved，
+在算子仓 A 中开发 Ascend C 融合算子 `torch.ops.npu.split_interleaved_rope`，
+融合 torch.split、cast、cat 等小算子，并按仓内既有对标算子的方式完成编译和单测。
 ```
 
-第二类是“修 bug”提示词，重点是先复现，再定位，再修改。例如：
+第二类是“修 bug”提示词，重点是先复现、再定位、再修改。例如：
 
 ```text
-当前测试脚本 B 中，
-test_split_interleaved_rope_dump_replay 多次执行会出现有时候通过、有时候失败，
-而且失败的 case 不固定。
-test_rotary_embedding_remove_padding_interleaved_dump_replay 稳定成功。
-请先复现当前现象，再排查并定位问题。
+测试脚本 B 中 `test_split_interleaved_rope_dump_replay` 多次执行结果不稳定，
+失败 case 不固定，而参考实现对应测试稳定成功。
+请先复现现象，再排查并定位问题。
 ```
 
-第三类是“问题定位/链路打通”提示词，重点是把服务脚本、容器、日志、成功标准全部给全。例如：
+第三类是“问题定位/链路打通”提示词，重点是明确服务脚本、容器、日志和成功标准。例如：
 
 ```text
-服务启动脚本为服务脚本 A，
-在容器环境 A 中执行。
-如果启动期间有报错，根据报错定位问题，
-可以修改算子的实现，重新编译、安装，再启动服务验证是否正常。
-启动成功后，在容器中执行 ark_client 请求；
-请求返回成功，才算验证通过。
-需要确保 torch.ops.npu.split_interleaved_rope 在 GE 模式下调用成功。
+服务脚本 A 在容器环境 A 中执行。
+若启动报错，请根据日志定位问题，并在必要时修改算子实现、重新编译安装后再次验证。
+启动成功后以客户端请求成功作为最终验收标准，目标是保证 `torch.ops.npu.split_interleaved_rope` 在 GE 模式下可稳定调用。
 ```
 
 这三类提示词具有共同特征：并非笼统提出“开发一个算子”或“排查一个问题”，而是尽可能显式提供以下信息：
@@ -206,6 +190,47 @@ test_rotary_embedding_remove_padding_interleaved_dump_replay 稳定成功。
 ### 4.1 算子功能与工程落地
 
 `split_interleaved_rope` 的核心功能是融合 `index_q` 的 interleaved RoPE 计算与 NoPE 拼接逻辑。
+
+从功能视角看，原始链路与融合后链路的关系如下：
+
+```mermaid
+flowchart LR
+    subgraph Before["融合前链路"]
+        A1[Slice]
+        A2[Cast]
+        A3[Cast]
+        A4[RotaryEmbedding]
+        A5[Slice]
+        A6[ConcatD]
+        A1 --> A2 --> A3 --> A4 --> A5 --> A6
+    end
+
+    subgraph After["融合后链路"]
+        B1[torch.ops.npu.split_interleaved_rope]
+    end
+
+    Before -. 等价替换 .-> After
+```
+
+从工程接入视角看，融合算子并不是单一 kernel，而是一条完整的接入链路：
+
+```mermaid
+flowchart LR
+    P0[Python调用<br/>torch.ops.npu.split_interleaved_rope]
+    P1[PyTorch 注册]
+    P2[Host 实现]
+    P3[AscendC Kernel]
+    P4[Tiling / custom OPP]
+    P5[GE Converter]
+    P6[测试验证<br/>eager / replay / GE]
+
+    P0 --> P1 --> P2 --> P3
+    P2 --> P4
+    P1 --> P5
+    P3 --> P6
+    P4 --> P6
+    P5 --> P6
+```
 
 Python API 形式如下：
 
@@ -232,7 +257,7 @@ torch.ops.npu.split_interleaved_rope(
 - `qk_rope_head_dim` 必须为偶数，且不大于 `index_head_dim`。
 - 输出 shape 为 `[bsz, q_len, heads, index_head_dim]`。
 
-其融合逻辑可概括为：
+其融合逻辑如下：
 
 - 将 `index_q_input` 视为 `[bsz, q_len, heads, index_head_dim]`。
 - 前 `qk_rope_head_dim` 维作为 PE 部分，执行 interleaved RoPE：
@@ -253,7 +278,7 @@ out_odd  = x_odd  * cos + x_even * sin
 - GE converter：将 PyTorch FX 节点转换为 GE custom op，并固化输出 meta shape。
 - 单测：覆盖 eager 随机用例、dump replay 和 GE smoke。
 
-在明确算子功能之后，影响开发效率的关键因素转向了如何将需求、问题与验证条件准确传递给 Agent。下面结合本次过程，说明如何通过提示词推动任务逐步收敛。
+在明确算子功能之后，开发效率的关键转向如何将需求、问题与验证条件准确传递给 Agent。下面结合本次过程，说明如何通过提示词推动任务逐步收敛。
 
 ### 4.2 实践过程：如何用提示词推进任务
 
@@ -261,11 +286,11 @@ out_odd  = x_odd  * cos + x_even * sin
 
 #### 4.2.1 需求阶段
 
-需求阶段的关键在于明确算子语义，包括原始链路、输入输出和目标收益。与第 3.3 节的通用模板对应，这一阶段的重点是完整给出“原始链路、融合目标、输入输出约束和验收标准”，从而先行收敛需求边界。
+需求阶段的关键在于明确算子语义，即原始链路、输入输出和目标收益。对应到第 3.3 节，这一阶段的重点是给出融合目标、输入输出约束和验收标准，以先行收敛需求边界。
 
 #### 4.2.2 复现阶段
 
-复现阶段需要明确“在哪里运行、如何运行、关注哪些结果”。与第 3.3 节相比，这里不再强调模板本身，而更强调复现信息应当最小但完整。例如：
+复现阶段需要明确“在哪里运行、如何运行、关注哪些结果”。这一阶段强调复现信息最小但完整，例如：
 
 - 单测路径：`测试脚本 A`。
 - 业务 profile 路径：`测试脚本 B`。
@@ -273,7 +298,7 @@ out_odd  = x_odd  * cos + x_even * sin
 - 环境变量：`ASCEND_CUSTOM_OPP_PATH`、`LD_LIBRARY_PATH`。
 - 服务或 profile 日志路径。
 
-这样可以使 Agent 直接进入可复现状态，而不必额外消耗时间猜测运行方式。
+这样可以使 Agent 直接进入可复现状态，而不必额外猜测运行方式。
 
 #### 4.2.3 调试阶段
 
@@ -283,7 +308,7 @@ out_odd  = x_odd  * cos + x_even * sin
 先复现问题，再定位根因，再修改实现，最后重新编译安装并验证。
 ```
 
-这一约束对 GE 问题尤为重要。许多 GE 问题表面上表现为“输出错误”，但根因往往位于编译期 shape 传递、converter 或 OPP 环境。因此，在这一阶段应首先限定“先复现，再区分运行时结果错误与编译期描述错误”，避免过早陷入实现细节。具体案例将在第 5.2 节展开。
+这一约束对 GE 问题尤为重要。许多 GE 问题表面上表现为“输出错误”，根因却位于编译期 shape 传递、converter 或 OPP 环境。因此，应先区分运行时结果错误与编译期描述错误，避免过早陷入实现细节。具体案例见第 5.2 节。
 
 #### 4.2.4 性能阶段
 
@@ -295,7 +320,7 @@ msprof --output=./msprof_out/ pytest -s <test_script_b>
 
 本次通过 profile 观察到 `split_interleaved_rope` 存在显著耗时波动。结合输入数据进一步分析后发现，大量 token 的 position 为 0，且真实场景中 `sin[0]` 为 0、`cos[0]` 为 1，此时 RoPE 等价于 identity。基于这一特征，最终引入安全 fast path，以直接 copy 的方式降低计算开销。
 
-在通过提示词明确任务边界之后，接下来的重点转向正确性、GE 可用性与性能问题的分项解决。首先需要确保融合算子在各类输入场景下与原始实现保持一致。
+在通过提示词明确任务边界之后，接下来的重点转向正确性、GE 可用性与性能问题的分项解决。首先要确保融合算子在各类输入场景下与原始实现保持一致。
 
 ## 5. 精度、GE 与性能问题定位
 
@@ -334,7 +359,7 @@ cos[0] == 1
 Layout BSND, queryDims (0) must be 4!
 ```
 
-从现象上看，非 GE 模式可以正常运行，而 GE 模式失败。由此很容易引出一个问题：融合算子在 GE 与非 GE 下的输出 shape 是否存在差异？
+从现象上看，非 GE 模式可以正常运行，而 GE 模式失败。一个自然的问题是：融合算子在 GE 与非 GE 下的输出 shape 是否存在差异？
 
 实际结论是：
 
@@ -389,7 +414,7 @@ torch.ops.npu.split_interleaved_rope
 - 用 msprof 数据确认问题，而不是只凭代码推测瓶颈。
 - 用优化前后数据闭环验证收益。
 
-本次 profile 结果表明，融合算子不仅降低了原多算子链路的整体耗时，也使性能问题能够更集中地落在单个 kernel 内进行分析。
+本次 profile 结果表明，融合算子不仅降低了原多算子链路的整体耗时，也使性能问题能够集中到单个 kernel 内分析。
 
 在功能、GE 和性能三个层面形成闭环之后，便可以进一步回看这次开发带来的实际价值，并总结可复用的方法。
 
@@ -397,7 +422,28 @@ torch.ops.npu.split_interleaved_rope
 
 ### 6.1 开发效果
 
-本次实践的结果可以从功能、性能和工程化三个方面进行总结。
+本次实践的收益可概括为“功能完成、性能提升、工程闭环”三方面：
+
+```mermaid
+flowchart TB
+    R[开发效果]
+
+    R --> R1[功能收益]
+    R --> R2[性能收益]
+    R --> R3[工程收益]
+
+    R1 --> R11[完成多算子链路等价替换]
+    R1 --> R12[支持 GE / 非 GE 使用]
+    R1 --> R13[支持融合优先与原始实现回退]
+
+    R2 --> R21[链路耗时 32.241us -> 22.2us]
+    R2 --> R22[减少调度与中间Tensor开销]
+    R2 --> R23[引入安全 fast path]
+
+    R3 --> R31[补齐注册/Host/Kernel/Tiling/GE Converter]
+    R3 --> R32[补齐单测与验证流程]
+    R3 --> R33[沉淀可复用开发模板]
+```
 
 功能方面：
 
@@ -418,18 +464,11 @@ torch.ops.npu.split_interleaved_rope
 - 明确了 wheel 安装、custom OPP 环境变量、GE 编译缓存清理等标准流程。
 - 形成了可迁移到其他融合算子的开发和验证模板。
 
-方法沉淀方面：
-
-- CANNBot Skills 适合承担“知识索引 + 流程约束 + 调试方法 + 验证闭环”的角色。
-- 对复杂算子开发，提示词应尽量提供完整上下文和验收标准。
-- 精度、GE、性能三个问题要分阶段拆解，不宜混在一起处理。
-
 ### 6.2 经验总结
-
-从结果回到方法，本次实践也沉淀出一套较为清晰的开发经验。
 
 本次实践沉淀出以下经验：
 
+- CANNBot Skills 更适合作为“知识索引 + 流程约束 + 调试方法 + 验证闭环”的方法库，而非单纯的代码生成工具。
 - 提示词要具体：路径、容器、命令、日志、目标和验收标准越明确，Agent 越容易进入有效工作状态。
 - 先复现再修改：无论是精度问题、GE 问题还是性能问题，都应先构造可复现用例。
 - 随机单测和真实 dump 要结合：真实 dump 反映业务分布，随机单测保证泛化正确性。
@@ -437,4 +476,4 @@ torch.ops.npu.split_interleaved_rope
 - 性能优化要基于 profile：通过 msprof 观察耗时、shape、block dim 和流水指标，再决定优化方向。
 - 安装和缓存是自定义算子调试的一部分：wheel 覆盖、OPP 路径、TBE cache 都可能影响验证结果。
 
-总体来看，`torch.ops.npu.split_interleaved_rope` 的开发实践表明，CANNBot Skills 不仅是“生成代码”的工具，更适合作为 AscendC 算子开发过程中的方法库与流程助手。它能够帮助开发者将问题拆解为需求分析、工程搭建、精度调试、GE 适配和性能验证等阶段，并在各阶段提供可复用的经验与检查点。
+总体来看，CANNBot Skills 更适合作为 AscendC 算子开发过程中的方法库与流程助手，而非单纯的代码生成工具。
