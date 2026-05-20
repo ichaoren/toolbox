@@ -736,3 +736,9 @@ need_nz_cache = get_ascend_config().enable_kv_nz and is_kv_transfer_end
 - Decode PP size 当前必须为 1，且当前实现不支持同时开启 PP 和 PCP。
 - P/D 节点必须配置互相可达的 Mooncake side channel 与通信网卡，`engine_id` 也必须彼此不同。
 - NPU 侧需要保证 CANN、torch-npu、Mooncake Transfer Engine 与 vLLM Ascend 版本匹配，最终效果仍需在真机压测验证。
+
+## 9. 会议纪要总结
+
+- 介绍了 NPU 硬件下基于 `MooncakeConnector` 的 PD 分离整体流程：请求经 Proxy 调度后，先由 Prefill 侧生成并保留 KV，再由 Decode 侧远端拉取 KV 后继续生成。
+- 梳理了链路中的关键环节：初始化配置、Proxy 选路、vLLM scheduler 决策、worker 侧 ZMQ 握手、Mooncake KV 传输，以及拉取完成后的 KV 重排和资源释放。
+- 说明了关键元信息和接入约束：`kv_transfer_params`、`MooncakeAgentMetadata`、`GET_META_MSG`、`DONE_RECVING_MSG` 的作用，以及新模型接入时对 KV Cache 结构、并行配置、网络连通性和 NPU 软件栈的一致性要求。
