@@ -47,7 +47,28 @@ Slice + Cast + Cast + RotaryEmbedding + Slice + ConcatD
 
 CANNBot Skills 是面向 CANN 开发的可复用技能库，覆盖 AscendC 算子开发、调试、性能分析、文档生成和模型推理优化等场景。其核心价值在于将算子开发中的工程模板、调试方法与性能分析经验沉淀为可复用能力。
 
-### 3.1 能力分层与本次用到的 Skills
+### 3.1 适用场景、问题类型与能力分层
+
+从 `cannbot-skills` 仓库的整体设计来看，CANNBot 面向的不只是单一算子开发任务，而是一组围绕昇腾 NPU 开发的典型问题场景。其目标用户包括 CANN 社区开发者、Ascend C / PyPTO / TileLang 算子开发者，以及使用昇腾 NPU 进行模型推理优化的开发者。
+
+结合仓库中的 Skills、Teams 和 quickstart 入口，CANNBot 主要适用于以下几类场景：
+
+| 场景 | 典型问题 | 对应能力 |
+| --- | --- | --- |
+| Ascend C 算子注册调用开发 | 从零开发注册算子、补齐 host/kernel/tiling/OPP/GE 配套 | `ops-registry-invoke`、`ascendc-registry-invoke-template` |
+| Ascend C Kernel 直调开发 | 快速验证 kernel 逻辑、从直调工程迁移到标准算子工程 | `ops-direct-invoke`、`ascendc-direct-invoke-template`、`ascendc-direct-invoke-to-registry-invoke` |
+| 算子设计与实现 | 明确输入输出、shape/dtype 约束、Tiling 策略和工程接入方式 | `ascendc-tiling-design`、`ascendc-api-best-practices` |
+| 精度与正确性定位 | 输出 mismatch、随机值、全 0、边界 case 失败 | `ascendc-precision-debug`、`ops-precision-standard` |
+| 运行时与图模式问题定位 | GE 编译失败、错误码、Kernel 查找失败、环境变量或 OPP 配置问题 | `ascendc-runtime-debug`、`ascendc-env-check` |
+| 性能采集与调优 | kernel 耗时高、波动大、缺少 profile 证据 | `ops-profiling`、`ascendc-performance-best-practices` |
+| 测试与验收 | 设计 ST/UT、补齐覆盖率、构建验收矩阵 | `ascendc-st-design`、`ascendc-ut-develop` |
+| 模型推理优化 | 图模式适配、融合算子替换、KVCache、多流优化 | `model/*` 目录下的推理优化 Skills 与 Teams |
+
+如果从“解决什么问题”的角度理解，CANNBot 的价值主要体现在三点：
+
+- 当需求不清晰时，帮助开发者把算子语义、约束、验收标准和工程边界补齐。
+- 当问题难以定位时，提供面向精度、运行时、环境和性能的分场景排查路径。
+- 当流程较长时，通过 Teams、Agents 和 Skills 的分层组织，把需求分析、开发、测试和优化串成可复用流程。
 
 从能力组织形式看，CANNBot Skills 采用三层结构：
 
@@ -417,4 +438,3 @@ torch.ops.npu.split_interleaved_rope
 - 安装和缓存是自定义算子调试的一部分：wheel 覆盖、OPP 路径、TBE cache 都可能影响验证结果。
 
 总体来看，`torch.ops.npu.split_interleaved_rope` 的开发实践表明，CANNBot Skills 不仅是“生成代码”的工具，更适合作为 AscendC 算子开发过程中的方法库与流程助手。它能够帮助开发者将问题拆解为需求分析、工程搭建、精度调试、GE 适配和性能验证等阶段，并在各阶段提供可复用的经验与检查点。
-
