@@ -1,0 +1,90 @@
+sequenceDiagram
+    autonumber
+    participant U as 用户请求
+    participant CLI as EngineArgs / CLI
+    participant SC as SchedulerConfig
+    participant EC as EngineCore
+    participant AS as AsyncScheduler
+    participant EX as ModelExecutor
+    participant GPU as GPU Worker
+    participant SO as Structured Output
+    participant KV as KV Cache
+
+    U->>CLI: 传入 --async-scheduling
+    CLI->>SC: 创建 SchedulerConfig(async_scheduling=True)
+    SC->>EC: get_scheduler_cls()
+    SC-->>EC: 返回 AsyncScheduler
+    EC->>AS: 初始化调度器
+    EC->>EX: 初始化执行器 / KV Cache
+
+    loop EngineCore busy loop
+        EC->>AS: schedule()
+        Note over AS: 计算本轮 num_scheduled_tokens\n构造 SchedulerOutput
+        AS->>AS: _update_after_schedule()
+        Note over AS: 更新 num_computed_tokens
+        Note over AS: 为 decode 请求增加 num_output_placeholders
+        Note over AS: 为 spec decode 放入 placeholder spec_token_ids
+        AS-->>EC: SchedulerOutput
+
+        EC->>EX: execute_model(scheduler_output, non_block=True)
+        EX->>GPU: 异步提交模型执行
+        GPU-->>EX: 返回 future
+
+        alt 无 pending_structured_output_tokens
+            EC->>AS: get_grammar_bitmask()
+            AS->>SO: grammar_bitmask(...)
+            SO-->>AS: bitmask
+            AS-->>EC: GrammarOutput
+            EC->>EX: sample_tokens(grammar_output, non_block=True)
+            EX->>GPU: 异步采样
+        else 有 pending_structured_output_tokens
+            Note over EC: 延迟 grammar 计算与采样
+            EC->>EC: deferred_scheduler_output = scheduler_output
+        end
+
+        alt batch queue 未满且还能继续推进
+            Note over EC: 继续 schedule 下一批\n不立刻等待当前结果
+        else 需要消费最早结果
+            EC->>EX: future.result()
+            EX->>GPU: 等待执行完成
+            GPU-->>EX: model_output / sampled_token_ids
+            EX-->>EC: ModelRunnerOutput
+        end
+
+        EC->>EC: _process_aborts_queue()
+
+        EC->>AS: update_from_output(scheduler_output, model_output)
+        Note over AS: 处理 sampled_token_ids
+        Note over AS: 处理 spec token accept/reject
+        Note over AS: 回退 num_computed_tokens / num_output_placeholders(如有拒绝)
+
+        AS->>AS: _update_request_with_output()
+        alt discard_latest_async_tokens = True
+            Note over AS: 丢弃最新异步 token\n避免 reset_prefix_cache 后重复输出
+        else 正常输出
+            AS->>AS: 追加 output_token_ids
+            AS->>KV: cache_blocks(...)
+            Note over AS: 基于 num_computed_tokens - num_output_placeholders\n确定可安全缓存的 token 范围
+        end
+
+        alt 请求达到停止条件
+            AS->>KV: 释放请求相关 block
+            AS-->>EC: finished request outputs
+        else 请求继续运行
+            AS-->>EC: incremental outputs
+        end
+
+        alt deferred_scheduler_output 存在
+            alt use_spec_decode = True
+                EC->>EX: take_draft_token_ids()
+                EX-->>EC: draft_token_ids
+                EC->>AS: update_draft_token_ids_in_output(...)
+            end
+            EC->>AS: get_grammar_bitmask(deferred_scheduler_output)
+            AS->>SO: grammar_bitmask(...)
+            SO-->>AS: bitmask
+            AS-->>EC: GrammarOutput
+            EC->>EX: sample_tokens(grammar_output, non_block=True)
+            EX->>GPU: 异步采样 deferred batch
+        end
+    end
