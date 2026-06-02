@@ -1,0 +1,10 @@
+2026-05-28 17:25:58.164 583982 process_spawn_utils.py:121 [ERROR]: Process 584215 terminated with code -9
+2026-05-28 17:25:58.165 583938 error_handler.py:50 [ERROR]: Error happens: Process 584215 terminated with code -9
+
+dmesg -T | grep -Ei "killed process|out of memory|oom|584215" 
+ [Thu May 28 17:26:01 2026] ai-agent invoked oom-killer: gfp_mask=0x1100cca(GFP_HIGHUSER_MOVABLE), order=0, oom_score_adj=0 
+ [Thu May 28 17:26:01 2026]  oom_kill_process+0x240/0x248 
+ [Thu May 28 17:26:02 2026] [  pid  ]   uid  tgid total_vm      rss pgtables_bytes swapents oom_score_adj name 
+ [Thu May 28 17:26:07 2026] oom-kill:constraint=CONSTRAINT_NONE,nodemask=(null),cpuset=/,mems_allowed=0-7,global_oom,task_memcg=/docker/f224f5d18558f3df2292437f1edd3253a68fa2c14c31be4d68dd7d0b5390435e,task=xLLM::XWorker_D,pid=759771,uid=0 
+ [Thu May 28 17:26:07 2026] Out of memory: Killed process 759771 (xLLM::XWorker_D) total-vm:9562968512kB, anon-rss:669403904kB, file-rss:0kB, shmem-rss:5367296kB, UID:0 pgtables:84608kB oom_score_adj:0 
+ [Thu May 28 17:26:11 2026] oom_reaper: reaped process 759771 (xLLM::XWorker_D), now anon-rss:0kB, file-rss:0kB, shmem-rss:5367616kB
