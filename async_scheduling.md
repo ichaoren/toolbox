@@ -1,6 +1,6 @@
 # Async Scheduling 处理流程解析
 
-这份文档说明 `--async-scheduling` 在 vLLM V1 引擎中的实际处理流程，以及它如何影响调度器、`EngineCore` 主循环和请求生命周期。
+这份文档说明 `--async-scheduling` 在 vLLM V1 引擎中的实际处理流程，以及它如何影响调度器、`EngineCore` 主循环和请求生命周期。   TASK_QUEUE_ENABLE(TODO)
 
 [TOC]
 
