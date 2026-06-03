@@ -13,36 +13,4 @@ dmesg -T | grep -Ei "killed process|out of memory|oom|584215"
 
 2. pytorch显存分析
 https://docs.pytorch.org/memory_viz
-
-+ENABLE_MEMORY_SNAPSHOT = os.getenv("ENABLE_MEMORY_SNAPSHOT", "false").lower() == "true"
-+MEMORY_SNAPSHOT_PATH = os.getenv("MEMORY_SNAPSHOT_PATH", "./profiling/memory")
-+os.makedirs(MEMORY_SNAPSHOT_PATH, exist_ok=True)
-+MAX_NUM_OF_MEM_EVENTS_PER_SNAPSHOT = 100000
-+if ENABLE_MEMORY_SNAPSHOT:
-+    torch.npu.memory._record_memory_history(
-+        max_entries=MAX_NUM_OF_MEM_EVENTS_PER_SNAPSHOT,
-+        context='all',
-+        stacks='python'
-+    )
- 
- 
- def _append_spec_step_timing(draft_elapsed_ms: float, verify_elapsed_ms: float, step_elapsed_ms: float, batch_size: int) -> None:
-+    global ENABLE_MEMORY_SNAPSHOT
-     _SPEC_STEP_TIMING_STATS["draft"].append(float(draft_elapsed_ms))
-     _SPEC_STEP_TIMING_STATS["verify"].append(float(verify_elapsed_ms))
-     _SPEC_STEP_TIMING_STATS["step"].append(float(step_elapsed_ms))
-     _SPEC_STEP_TIMING_STATS["batch_size"].append(int(batch_size))
- 
-     count = len(_SPEC_STEP_TIMING_STATS["step"])
-+
-+    if ENABLE_MEMORY_SNAPSHOT and count == 50:
-+        try:
-+            logger.info(f"Begin to dump memory, path is {MEMORY_SNAPSHOT_PATH}.")
-+            import datetime
-+            torch.npu.memory._dump_snapshot(f"{MEMORY_SNAPSHOT_PATH}/{datetime.datetime.now().strftime('%H:%M:%S')}.pickle")
-+        except Exception as e:
-+            logger.error(f"Failed to capture memory snapshot {e}")
-+
-+        torch.npu.memory._record_memory_history(enabled=None)
-+        ENABLE_MEMORY_SNAPSHOT = False
-+
+https://zhuanlan.zhihu.com/p/677203832
