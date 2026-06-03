@@ -1,3 +1,5 @@
+基于 CANNBot Skills 开发 AscendC 融合算子实践
+
 ## 1. 摘要
 
 本文以 `torch.ops.npu.split_interleaved_rope` 融合算子为例，总结一次借助 CANNBot Skills 完成 AscendC 融合算子开发的实践过程。目标是将 MLA Decode 链路中的 `Slice + Cast + Cast + RotaryEmbedding + Slice + ConcatD` 融合为单算子实现，并在保证功能正确、GE/非 GE 链路可用的前提下，将耗时从 `32.241us` 优化到 `22.2us`。
