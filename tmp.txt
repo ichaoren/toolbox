@@ -14,3 +14,16 @@ dmesg -T | grep -Ei "killed process|out of memory|oom|584215"
 2. pytorch显存分析
 https://docs.pytorch.org/memory_viz
 https://zhuanlan.zhihu.com/p/677203832
+
+博客记录
+1.性能问题的定位流程
+https://www.hiascend.com/document/detail/zh/mindstudio/81RC1/practicalcases/GeneralPerformanceIssue/toolsample6_002.html
+1）问题信息收集：模型结构、卡数、机器数、并行参数配置、框架和版本。当前主要问题和优化目标。下发、通信、计算。
+2）TopN性能问题的解决方案：亲和算子优化(IndexPutV2/Nonzero)、Host Bound(流水优化、绑核优化)
+
+2. 小算子消除
+1）小算子是否完全必要，transpose、
+
+
+权重预取：https://wiki.huawei.com/domains/4600/wiki/254291/WIKI202507297679280
+
