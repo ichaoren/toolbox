@@ -322,7 +322,11 @@ if (
     )
 ```
 
-后续 `_preprocess()` 才进入真正的 VL embedding 路径。Ascend 这里覆写 `_preprocess()`，主要是为 PCP + MM 临时本地化 `scheduler_output`，然后复用父类逻辑：
+后续 `_preprocess()` 才进入真正的 VL embedding 路径。它发生在 `_build_attention_metadata()` 之后、`_model_forward()` 之前，此时 `_prepare_inputs()` 已经确定了本轮 token 的扁平顺序、position、`query_start_loc` 和 `input_ids`。这点很重要：多模态 embedding 必须按照同一套扁平 token 顺序写入 `inputs_embeds`，否则视觉 token 会和文本上下文错位。
+
+### `_preprocess` 的上下文和分支
+
+Ascend 这里覆写 `_preprocess()`，主要是为 PCP + MM 临时本地化 `scheduler_output`，然后复用父类逻辑：
 
 ```python
 restore_state = self.pcp_manager.maybe_localize_scheduler_output_for_mm_preprocess(
@@ -343,12 +347,31 @@ finally:
         scheduler_output, restore_state)
 ```
 
-父类 `_preprocess()` 对普通 decoder-only VL 模型的流程是：
+父类 `_preprocess()` 入口先判断三个上下文条件：
+
+```python
+num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+is_first_rank = get_pp_group().is_first_rank
+is_encoder_decoder = self.model_config.is_encoder_decoder
+
+if self.supports_mm_inputs and is_first_rank and not is_encoder_decoder:
+    ...
+elif self.enable_prompt_embeds and is_first_rank:
+    ...
+else:
+    ...
+```
+
+对普通 decoder-only VL 模型，走第一个分支。它把文本 token embedding 和视觉 embedding 统一写入同一个 `inputs_embeds`：
 
 ```python
 if self.supports_mm_inputs and is_first_rank and not is_encoder_decoder:
-    self._execute_mm_encoder(scheduler_output)
-    mm_embeds, is_mm_embed = self._gather_mm_embeddings(scheduler_output)
+    with self.maybe_get_ec_connector_output(
+        scheduler_output,
+        encoder_cache=self.encoder_cache,
+    ) as ec_connector_output:
+        self._execute_mm_encoder(scheduler_output)
+        mm_embeds, is_mm_embed = self._gather_mm_embeddings(scheduler_output)
 
     inputs_embeds_scheduled = self.model.embed_input_ids(
         self.input_ids.gpu[:num_scheduled_tokens],
@@ -371,6 +394,37 @@ if self.supports_mm_inputs and is_first_rank and not is_encoder_decoder:
 - `_gather_mm_embeddings()`：按 `_prepare_inputs()` 已确定的 token 顺序，找出本轮窗口内哪些 token 是多模态占位符，并从 `encoder_cache` 抽取对应 embedding。
 - `model.embed_input_ids()`：先把文本 token id 走 embedding 层，再用 `is_mm_embed` mask 把视觉位置替换成视觉 embedding。
 - `_prepare_mm_inputs()`：大多数 VL 模型返回 `input_ids=None, inputs_embeds=...`；如果模型 `requires_raw_input_tokens`，也会把 raw `input_ids` 一并传入。
+
+随后 `_preprocess()` 选择 position。VL 模型如果使用 M-RoPE/XD-RoPE，就不会使用普通一维 `self.positions`：
+
+```python
+if self.uses_mrope:
+    positions = self.mrope_positions.gpu[:, :num_input_tokens]
+elif self.uses_xdrope_dim > 0:
+    positions = self.xdrope_positions.gpu[:, :num_input_tokens]
+else:
+    positions = self.positions[:num_input_tokens]
+```
+
+最终 `_preprocess()` 返回：
+
+```python
+return (
+    input_ids,
+    inputs_embeds,
+    positions,
+    intermediate_tensors,
+    model_kwargs,
+    ec_connector_output,
+)
+```
+
+因此，对大多数 decoder-only VL 模型，进入 `_model_forward()` 前的输入形态是：
+
+- `input_ids = None`，除非模型声明 `requires_raw_input_tokens`。
+- `inputs_embeds = self.inputs_embeds.gpu[:num_input_tokens]`，文本 token 和视觉 token 都已经在这个张量里。
+- `positions = self.mrope_positions / self.xdrope_positions / self.positions` 中的一种。
+- `model_kwargs` 带上基础 kwargs 和 `_extract_mm_kwargs(scheduler_output)` 提取出的多模态相关参数。
 
 ```mermaid
 sequenceDiagram
@@ -422,6 +476,31 @@ for i in range(lo, hi):
 
 这个 mask 很关键：文本 token 和视觉 token 最终都在同一个 `inputs_embeds` 张量里，`is_mm_embed` 指出哪些位置要用 `mm_embeds` 替换，而不是用普通 token embedding。
 
+`_execute_mm_encoder()` 则负责让 `encoder_cache` 中真的有这些 embedding。它先从 scheduler 输出中拿到本轮需要编码的多模态输入：
+
+```python
+scheduled_encoder_inputs = scheduler_output.scheduled_encoder_inputs
+for req_id, encoder_input_ids in scheduled_encoder_inputs.items():
+    req_state = self.requests[req_id]
+    for mm_input_id in encoder_input_ids:
+        mm_feature = req_state.mm_features[mm_input_id]
+        mm_hashes.append(mm_feature.identifier)
+        mm_kwargs.append((mm_feature.modality, mm_feature.data))
+```
+
+然后按 modality 分组调用模型的多模态 encoder，并按 `mm_hash` 缓存输出：
+
+```python
+for modality, num_items, mm_kwargs_batch in group_and_batch_mm_kwargs(...):
+    batch_outputs = model.embed_multimodal(**mm_kwargs_batch)
+    encoder_outputs.extend(batch_outputs)
+
+for mm_hash, output in zip(mm_hashes, encoder_outputs):
+    self.encoder_cache[mm_hash] = output
+```
+
+`prompt_embeds` 是特殊 passthrough modality，它已经是模型 embedding 空间里的张量，不需要跑 encoder，会直接写入 `encoder_cache`，后续也通过相同的 `_gather_mm_embeddings()` 路径拼接。
+
 Ascend 在 PCP 场景重写了 `_gather_mm_embeddings()`，核心差异是使用 `_prepare_inputs()` 缓存的本地 schedule layout：
 
 ```python
@@ -440,6 +519,163 @@ mm_embeds, should_sync_mrope_positions, should_sync_xdrope_positions = \
 ```
 
 如果多模态 pruning 或 PCP 处理导致 M-RoPE/XD-RoPE position 需要变化，这里会重新计算并同步到 NPU。
+
+### 完整例子：文本 token 和视觉 token 如何合并
+
+假设一个 decoder-only VL 请求 `reqA`，没有 PCP，没有 speculative decode，当前是 prefill，`num_computed_tokens = 0`，本轮调度 6 个 token。模型处理器已经把图片占位展开成 3 个视觉占位 token：
+
+| 扁平位置 | 原始含义 | `input_ids` 中的内容 | 最终 `inputs_embeds` |
+| --- | --- | --- | --- |
+| 0 | BOS | `T_BOS` | `Emb(T_BOS)` |
+| 1 | 文本“描述” | `T_text_0` | `Emb(T_text_0)` |
+| 2 | 图片 patch 0 占位 | `T_img_placeholder` | `E_img[0]` |
+| 3 | 图片 patch 1 占位 | `T_img_placeholder` | `E_img[1]` |
+| 4 | 图片 patch 2 占位 | `T_img_placeholder` | `E_img[2]` |
+| 5 | 文本“内容” | `T_text_1` | `Emb(T_text_1)` |
+
+这个例子中的 request 状态大致是：
+
+```python
+self.input_batch.req_ids = ["reqA"]
+scheduler_output.num_scheduled_tokens = {"reqA": 6}
+scheduler_output.scheduled_encoder_inputs = {"reqA": [0]}
+
+req_state.mm_features[0].identifier = "img_hash_0"
+req_state.mm_features[0].modality = "image"
+req_state.mm_features[0].mm_position.offset = 2
+req_state.mm_features[0].mm_position.length = 3
+```
+
+第一步，`_prepare_inputs()` 只按 token 表取出本轮的 token id。视觉位置此时仍然只是 placeholder token id：
+
+```python
+req_indices = [0, 0, 0, 0, 0, 0]
+positions_np = [0, 1, 2, 3, 4, 5]
+self.input_ids.cpu[:6] = [
+    T_BOS,
+    T_text_0,
+    T_img_placeholder,
+    T_img_placeholder,
+    T_img_placeholder,
+    T_text_1,
+]
+```
+
+如果这是 Qwen2-VL 这类 M-RoPE 模型，`_prepare_inputs()` 同时会准备：
+
+```python
+self._calc_mrope_positions(scheduler_output)
+self.mrope_positions.gpu.copy_(self.mrope_positions.cpu, non_blocking=True)
+```
+
+第二步，`_preprocess()` 运行视觉 encoder。`_execute_mm_encoder()` 从 `scheduled_encoder_inputs` 找到 `reqA` 的第 0 个多模态输入，调用：
+
+```python
+encoder_outputs = model.embed_multimodal(image=...)
+self.encoder_cache["img_hash_0"] = encoder_outputs[0]  # shape: [3, hidden_size]
+```
+
+第三步，`_gather_mm_embeddings()` 根据当前调度窗口 `[0, 6)` 和 `mm_position.offset = 2, length = 3` 计算交集，得到：
+
+```python
+mm_embeds = [self.encoder_cache["img_hash_0"][0:3]]
+is_mm_embed = [False, False, True, True, True, False]
+```
+
+第四步，`model.embed_input_ids()` 先对所有 `input_ids` 做文本 embedding，再用 `is_mm_embed` 将第 2、3、4 行替换成视觉 encoder 输出：
+
+```python
+inputs_embeds_scheduled = self.model.embed_input_ids(
+    self.input_ids.gpu[:6],
+    multimodal_embeddings=mm_embeds,
+    is_multimodal=is_mm_embed,
+)
+
+self.inputs_embeds.gpu[:6].copy_(inputs_embeds_scheduled)
+```
+
+最终进入 `_model_forward()` 的不是“文本 token id + 单独的视觉 token”，而是一条统一的 embedding 序列：
+
+```text
+inputs_embeds[0] = Emb(T_BOS)
+inputs_embeds[1] = Emb(T_text_0)
+inputs_embeds[2] = E_img[0]
+inputs_embeds[3] = E_img[1]
+inputs_embeds[4] = E_img[2]
+inputs_embeds[5] = Emb(T_text_1)
+```
+
+如果图模式或 DP/SP padding 让 `num_input_tokens > num_scheduled_tokens`，`_prepare_mm_inputs(num_input_tokens)` 返回的是带 padding 长度的 `inputs_embeds` slice；真实有效 token 仍由 attention metadata 中的 `num_actual_tokens`、`query_start_loc`、`seq_lens` 等约束。
+
+### VL 模型完整函数调用栈
+
+下面的调用栈按 `execute_model()` 的真实顺序整理。`_model_forward()` 之前详细展开，之后只保留粗粒度流程。
+
+```text
+NPUModelRunner.execute_model(scheduler_output)
+  ├─ _update_states(scheduler_output)
+  │    └─ 更新 self.input_batch / self.requests / block_table / sampling_metadata
+  ├─ _prepare_inputs(scheduler_output, num_scheduled_tokens_np)
+  │    ├─ block_table.commit_block_table(num_reqs)
+  │    ├─ 展开 req_indices，计算 cu_num_tokens / query_pos / positions_np
+  │    ├─ _build_attn_state(...)
+  │    ├─ PCP: update_tokens_for_pcp(...) 并重算本地 token 布局
+  │    ├─ 从 token_ids_cpu_tensor 按 token_indices 取 self.input_ids.cpu
+  │    ├─ prompt_embeds: 拷贝到 self.inputs_embeds.cpu 对应位置
+  │    ├─ _prepare_input_ids(...)
+  │    │    └─ 将 input_ids / inputs_embeds / is_token_ids 拷贝到 NPU
+  │    ├─ VL position:
+  │    │    ├─ uses_mrope: _calc_mrope_positions(...)
+  │    │    └─ uses_xdrope_dim > 0: _calc_xdrope_positions(...)
+  │    ├─ 更新 discard_request_indices / num_accepted_tokens
+  │    ├─ 更新 num_computed_tokens / req_indices / query_pos / seq_lens
+  │    ├─ compute_slot_mapping(...) 或使用 PCP 预计算 slot_mapping
+  │    ├─ speculative decode: _calc_spec_decode_metadata(...)
+  │    └─ PCP + MM: cache_local_schedule_layout(...)
+  ├─ _determine_batch_execution_and_padding(...)
+  │    └─ 得到 cudagraph_mode / batch_desc / num_tokens_padded
+  ├─ 可选: mamba_utils.preprocess_mamba(...)
+  ├─ _build_attention_metadata(...)
+  │    ├─ 构造 AscendCommonAttentionMetadata
+  │    ├─ 为每个 KV cache group / attention group 调 builder.build(...)
+  │    └─ is_mm_prefix_lm: 写入 attn_metadata[*].mm_prefix_range
+  ├─ _preprocess(scheduler_output, num_input_tokens, intermediate_tensors)
+  │    ├─ Ascend PCP + MM:
+  │    │    ├─ get_local_schedule_layout()
+  │    │    └─ maybe_localize_scheduler_output_for_mm_preprocess(...)
+  │    ├─ super()._preprocess(...)
+  │    │    ├─ VL decoder-only 分支:
+  │    │    │    ├─ _execute_mm_encoder(...)
+  │    │    │    │    ├─ _batch_mm_inputs_from_scheduler(...)
+  │    │    │    │    ├─ model.embed_multimodal(...)
+  │    │    │    │    └─ encoder_cache[mm_hash] = encoder_output
+  │    │    │    ├─ _gather_mm_embeddings(...)
+  │    │    │    │    ├─ get_mm_features_in_window(...)
+  │    │    │    │    ├─ 从 encoder_cache 取 mm_embeds
+  │    │    │    │    └─ 生成 is_mm_embed mask
+  │    │    │    ├─ model.embed_input_ids(
+  │    │    │    │      input_ids, multimodal_embeddings, is_multimodal)
+  │    │    │    ├─ self.inputs_embeds.gpu[:num_scheduled_tokens].copy_(...)
+  │    │    │    ├─ _prepare_mm_inputs(num_input_tokens)
+  │    │    │    └─ model_kwargs = _init_model_kwargs() + _extract_mm_kwargs(...)
+  │    │    ├─ 选择 positions: mrope / xdrope / normal positions
+  │    │    └─ PP 非首 rank: sync_and_gather_intermediate_tensors(...)
+  │    └─ Ascend PCP + MM: restore_scheduler_output_after_mm_preprocess(...)
+  ├─ update_cos_sin(positions)
+  ├─ set_ascend_forward_context(attn_metadata, ...)
+  ├─ maybe_get_kv_connector_output(...)
+  └─ _model_forward(num_tokens_padded, input_ids, positions,
+                   intermediate_tensors, inputs_embeds, **model_kwargs)
+
+_model_forward 之后:
+  ├─ 得到 hidden_states
+  ├─ PCP: restore hidden_states
+  ├─ PP/pooling 分支处理
+  ├─ sample_hidden_states = hidden_states[logits_indices]
+  ├─ logits = model.compute_logits(sample_hidden_states)
+  ├─ 保存 ExecuteModelState
+  └─ sample_tokens(): grammar mask / sampler / bookkeeping / speculative draft
+```
 
 ### MM prefix LM 的 attention 补充
 
