@@ -1,0 +1,301 @@
+权重下载
+https://www.modelscope.cn/organization/vllm-ascend?tab=all
+modelscope download --model vllm-ascend/Qwen3-0.6B-W8A8  --local_dir Qwen3-0.6B-W8A8
+
+打开requests库 源文件 session.py
+vi /xxx/.../xxx/envs/xxx/lib/python3.10/site-packages/requests/sessions.py
+找到request 函数，大概500行左右
+将verify=None改成verify=False
+modelscope download --model deepseek-ai/DeepSeek-V4-Flash-DSpark --local_dir DeepSeek-V4-Flash-DSpark
+
+创建docker
+IMAGES_ID=13315b656180
+NAME=code-test
+docker run --name ${NAME} -it -d --net=host --shm-size=500g \
+    --privileged=true \
+    -w /home \
+    --device=/dev/davinci_manager \
+    --device=/dev/hisi_hdc \
+    --device=/dev/devmm_svm \
+    --entrypoint=bash \
+    -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+    -v /usr/local/dcmi:/usr/local/dcmi \
+    -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
+    -v /usr/local/sbin:/usr/local/sbin \
+    -v /home:/home \
+    -v /tmp:/tmp \
+    -v /data:/data \
+    -v /usr/share/zoneinfo/Asia/Shanghai:/etc/localtime \
+    ${IMAGES_ID}
+
+
+
+启动命令
+#!/bin/sh
+
+local_ip="80.6.1.48"
+
+export CPU_AFFINITY_CONF=1
+#export VLLM_TORCH_PROFILER_DIR=./profile
+#export LD_PRELOAD=./libjemalloc.so.2:$LD_PRELOAD
+export TASK_QUEUE_ENABLE=1
+export VLLM_TORCH_PROFILER_WITH_STACK=0
+#export ASCEND_RT_VISIBLE_DEVICES=2,3
+
+#export SERVICE_PROF_CONFIG_PATH=ms_service_profiler_config.json
+#export PROFILING_SYMBOLS_PATH=service_profiling_symbols.yaml
+
+vllm serve /home/weight/Qwen3-VL-32B-Instruct/ \
+--served-model-name "qwen3-vl" \
+--host $local_ip \
+--port 9026 \
+--max-model-len 32768 \
+--max-num-batched-tokens 16384 \
+--gpu-memory-utilization 0.8 \
+--tensor-parallel-size 2 \
+--no-enable-prefix-caching \
+--async-scheduling \
+--quantization "ascend" \
+--compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}'
+
+离线请求
+pip install qwen_vl_utils --extra-index-url https://download.pytorch.org/whl/cpu/
+# export HCCL_DETERMINISTIC=true
+export VLLM_USE_V1=1
+export PYTORCH_NPU_ALLOC_CONF='expandable_segments:True'
+export TASK_QUEUE_ENABLE=1
+export CPU_AFFINITY_CONF=2
+export HCCL_OP_EXPANSION_MODE=AIV
+# export LD_PRELOAD="$LD_PRELOAD:/usr/lib/aarch64-linux-gnu/libjemalloc.so.2"
+export HCCL_IF_BASE_PORT=50000
+sysctl -w net.ipv4.ip_local_reserved_ports=50000-50015
+
+ASCEND_RT_VISIBLE_DEVICES=2,3 python test_main_qwen3vl.py
+
+from transformers import AutoProcessor
+from vllm import LLM, SamplingParams
+from qwen_vl_utils import process_vision_info
+
+import os
+#os.environ["VLLM_TORCH_PROFILER_DIR"] = './profile'     #指明profiling生成路径
+os.environ['DEBUG_SUBPROCESS'] = '1'
+
+# MODEL_PATH = "/mnt/nfs/y00899528/GLM-4.5V"
+MODEL_PATH = "/home/Test/model/Qwen3-VL-32B-quant/"
+#MODEL_PATH = "/home/Test/model/Qwen3-VL-32B-Instruct/"
+
+llm = LLM(
+    model=MODEL_PATH,
+    tensor_parallel_size=2,
+    # mm_parallel_size=2,
+    # ring_parallel_size=2,
+    #enable_expert_parallel=True,
+    max_model_len=16384,
+    enable_prefix_caching=False,
+    disable_mm_preprocessor_cache=True,
+    compilation_config={"cudagraph_mode": "FULL_DECODE_ONLY"},
+    mm_processor_cache_type="shm",
+    quantization="ascend",
+    #enforce_eager=True,
+    limit_mm_per_prompt={"image": 10, "video": 10}
+    # limit_mm_per_prompt={"image": 10},
+)
+
+sampling_params = SamplingParams(
+    max_tokens=5
+)
+#image
+
+
+image_messages = [
+    {"role": "system", "content": "You are a helpful assistant."},
+    {
+        "role": "user",
+        "content": [
+            {
+                "type": "image",
+                "image": "./480p.png",
+                "max_pixels": 1280 * 28 * 28,
+                "min_pixels":  224 * 224
+            },
+            {"type": "text", "text": "Please provide a detailed description of this image"},
+        ],
+    },
+]
+
+
+
+# video input
+'''
+video_path = "/mnt/nfs/y00899528/qwen3vl_vllm/script/v_-8SgY4vW4xM.mp4"
+image_messages = [
+    {"role": "system", "content": "You are a helpful assistant."},
+    {
+        "role": "user",
+        "content": [
+            {
+                "type": "video",
+                "video": "file:///" + video_path,
+                "total_pixels": 20480 * 28 * 28,
+                "min_pixels": 16 * 28 * 28
+            },
+            {"type": "text", "text": "Please provide a detailed description of this video"},
+        ],
+    },
+]
+'''
+messages = image_messages
+
+processor = AutoProcessor.from_pretrained(MODEL_PATH)
+prompt = processor.apply_chat_template(
+    messages,
+    tokenize=False,
+    add_generation_prompt=True,
+)
+
+image_inputs, _ = process_vision_info(messages)
+#image_inputs, _, _ = process_vision_info(messages, return_video_kwargs=True)
+# image_inputs, video_inputs = process_vision_info(messages)
+
+mm_data = {}
+if image_inputs is not None:
+    mm_data["image"] = image_inputs
+
+# if video_inputs is not None:
+#     mm_data["video"] = video_inputs
+
+llm_inputs = {
+    "prompt": prompt,
+    "multi_modal_data": mm_data,
+}
+for i in range(5):
+    if i == 4:
+        llm.start_profile()
+    outputs = llm.generate([llm_inputs], sampling_params=sampling_params)
+    if i == 4:
+        llm.stop_profile()
+generated_text = outputs[0].outputs[0].text
+print(generated_text)
+
+单条请求
+curl http://80.6.1.45:8800/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+    "model": "qwen3",
+    "messages": [
+    {"role": "system", "content": "You are a helpful assistant."},
+    {"role": "user", "content": [
+        {"type": "image", "image": "./qwen.png"},
+        {"type": "text", "text": "What is the text in the illustrate?"}
+    ]}
+    ]
+    }'
+
+curl http://80.6.1.45:8800/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+    "model": "qwen_235",
+    "messages": [
+    {"role": "system", "content": "You are a helpful assistant."},
+    {"role": "user", "content": [
+        {"type": "text", "text": "Who are you?"}
+    ]}
+    ]
+    }'
+
+profiling采集
+os.environ["VLLM_TORCH_PROFILER_DIR"] = './profile'
+
+# 在线开启profile
+curl -X POST http://141.61.133.111:8981/start_profile
+sleep 5
+curl -X POST http://141.61.133.111:8981/stop_profile
+from torch_npu.profiler.profiler import analyse
+analyse("./profile")
+
+调度信息采集
+https://gitcode.com/Ascend/msit/blob/master/msserviceprofiler/docs/vLLM%E6%9C%8D%E5%8A%A1%E5%8C%96%E6%80%A7%E8%83%BD%E9%87%87%E9%9B%86%E5%B7%A5%E5%85%B7.md
+pip install msserviceprofiler==1.2.2
+
+export SERVICE_PROF_CONFIG_PATH=ms_service_profiler_config.json
+export PROFILING_SYMBOLS_PATH=service_profiling_symbols.yaml
+
+# xxxx-xxxx 为采集工具根据 vLLM 启动时间自动创建的存放目录
+cd /root/.ms_server_profiler/xxxx-xxxx
+
+# 解析数据
+msserviceprofiler analyze --input-path=./ --output-path output
+
+# 打开
+sed -i 's/"enable":\s*0/"enable": 1/' ./ms_service_profiler_config.json
+
+# 关闭
+sed -i 's/"enable":\s*1/"enable": 0/' ./ms_service_profiler_config.json
+
+分析方法：
+1）单层算子提取，例如两个fa之间就是一层算子
+2）
+
+压测
+https://evalscope.readthedocs.io/zh-cn/latest/user_guides/stress_test/parameters.html
+evalscope perf   --parallel 64   --model qwen3-vl  --url http://80.6.1.48:8800/v1/chat/completions   --api openai   --dataset random_vl   --min-tokens 256   --max-tokens 256   --prefix-length 0   --min-prompt-length 400   --max-prompt-length 400   --image-width 640   --image-height 480   --image-format RGB   --image-num 6  --number 512   --tokenizer-path /data/model/Qwen3-VL-32B-Instruct/ > 11_512_evalbenchmark_batch_512.log 2>&1
+
+aisbench
+git clone https://github.com/AISBench/benchmark.git
+ais_bench --models vllm_api_general_chat --datasets gpqa_gen_0_shot_cot_chat_prompt --mode all --max-num-workers=4 --search
+
+vllm
+
+数据集下载
+https://ais-bench-benchmark.readthedocs.io/zh-cn/latest/get_started/datasets.html#id3https://ais-bench-benchmark.readthedocs.io/zh-cn/latest/get_started/datasets.html#id3
+
+代码重装
+
+
+pip uninstall vllm
+
+cd vllm
+git checkout tag
+
+export VLLM_TARGET_DEVICE=empty
+pip config set global.index-url https://mirrors.aliyun.com/pypi/simple
+pip config set install.trusted-host mirrors.aliyun.com
+#pip config set global.index-url https://repo.huaweicloud.com/repository/pypi/simple
+#pip config set global.trusted-host repo.huaweicloud.com
+pip install -v -e .
+
+pip install setuptools setuptools_rust setuptools_scm
+pip install -v -e . --no-build-isolation --no-deps
+
+pip uninstall vllm-ascend
+pip install -v -e .
+
+pip install -v -e . --no-build-isolation --no-deps
+
+代理相关
+参考 https://wiki.huawei.com/domains/4600/wiki/20122/WIKI202407244109457?title=%E5%9B%9B-%E4%B8%AA%E4%BA%BA%E4%BB%A3%E7%90%86%E9%85%8D%E7%BD%AE
+
+镜像下载
+https://3ms.huawei.com/km/blogs/details/21279584
+
+wget --no-check-certificate https://cmc-lfg-artifactory.cmc.tools.huawei.com/artifactory/generic-8166/hw-cr/quay.io/ascend/vllm-ascend/nightly-main-a3.tar.gz
+
+export http_proxy=http://p_test123:Huawei%40123@proxy.huawei.com:8080
+export https_proxy=http://p_test123:Huawei%40123@proxy.huawei.com:8080
+export ftp_proxy=http://p_test123:Huawei%40123@proxy.huawei.com:8080
+docker pull quay.nju.edu.cn/ascend/vllm-ascend:nightly-releases-v0.26.0rc-a3
+docker pull quay.nju.edu.cn/ascend/vllm-ascend:nightly-releases-v0.26.0rc-a5
+
+
+sudo vi /etc/hosts
+141.61.33.201 cmc-nkg-artifactory.cmc.tools.huawei.com
+wget --no-check-certificate https://cmc-nkg-artifactory.cmc.tools.huawei.com/artifactory/cmc-nkg-inner/MindIE/vLLM Ascend/26.2.0.daily/202608/20260826/vLLM-Ascend-images/vllm-ascend:dev-26.2.0.day20260826-A5-py311-openEuler24.03-lts-aarch64.tar.gz?_t=1787708667993&artifact_signature=eyJ0eXAiOiJhcnRpZmFjdF90b2tlbiIsImFsZyI6IlJTMzg0In0.eyJzdWIiOiJmMDA5Mjc2ODciLCJzY3AiOiI0Yyw3Iiwic3JjIjoiMzYyMDRhZWIwYzA3ZjQ5YjEyNDg5ZjlkNzU0YWFlMTRkZWVhZDM3MyIsImlzcyI6IkFydGlmYWN0Q21jXzAyIiwiYWN0aW9uIjpbInIiXSwiZXhwIjoxNzg3NzA4OTY3LCJkaXNwIjoidHJ1ZSIsImlhdCI6MTc4NzcwODY2NywidGlkIjoiZDk2ZTYyZjktNzAyOC00MDM2LWIwYzgtYWM5ZDIwNDk0NDMxIn0.0aQCLBe07PICB1EQ2h8jBcYJ5J_XVH5BUVpIe2oRXj4xeT27aV-aTKvj3DkF1JmkQnvOt4rwIIK9Zz6t8M6kZE9RyGvbPwqrZ2QakC6JWKageo3kskpE2TMtcZgC5dYvbsg7tLlpVEA3LhGftgamDM91V1PKGit_fF9Z268MgQbu704ts4IHea253CXadUQSPLPx8ppo7a32-LyjQZVKrnrx08M_gHO9ZsF-LoF65pvz7y0Y2ChqpoDvOmB2Bqr-Yoy1k97b0hRISM2PWtrIHVcrENquc9gSlWCKAaAjhdrv5RzHr0BZlVnpBP4fiOmNMtGL5-zkl4fLF8Hfitl__XHWkI7cLaGvI5VPsWX7n1bt-T5PtyWSUfxPjmcRvzl1L2C3qwJiuBVRVizlMFnBG9qSL0ICJR2fUOkXVLefN3mxujo5nLMPR4Mj6TZwsQAVw8mX8iqsGUlU_xntwB3yK-ezBpAvTx2CZqAAIoz9KXok2s9lm9hmiYdtK3mBTPGV
+
+每日构建版本
+https://cmc-szv.clouddragon.huawei.com/cmcversion/index/componentVersionView?deltaId=14861503811945984&isSelect=Inner
+
+版本配套表
+https://onebox.huawei.com/v/754b7ce354144fd96c6ed756359b9e38?type=1
+
+极光平台使用手册
+https://wiki.huawei.com/domains/143914/wiki/352633/WIKI2026031110365345
